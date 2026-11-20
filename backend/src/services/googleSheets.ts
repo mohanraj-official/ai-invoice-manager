@@ -5,7 +5,7 @@ import { googleOAuthClient } from './googleAuth.js'
 import type { ExtractedInvoice } from '../types/invoice.js'
 
 const spreadsheetId = process.env.GOOGLE_SHEET_ID
-const SHEET_NAME = 'INVOICES'
+const SHEET_NAME = process.env.GOOGLE_SHEET_TAB || 'INVOICES'
 
 const HEADERS = [
   'Invoice ID',

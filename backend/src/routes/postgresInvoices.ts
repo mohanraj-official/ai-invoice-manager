@@ -1,0 +1,176 @@
+import { Router } from 'express'
+import pool from '../db/postgres.js'
+
+const router = Router()
+
+// Dashboard statistics
+router.get('/stats', async (_req, res) => {
+  try {
+    const [invoices, duplicates, expenses] = await Promise.all([
+      pool.query('SELECT COUNT(*) AS total FROM invoices'),
+
+      pool.query(`
+        SELECT COUNT(*) AS total
+        FROM upload_events
+        WHERE is_duplicate = TRUE
+      `),
+
+      pool.query(`
+        SELECT COALESCE(SUM(total), 0) AS total
+        FROM invoice_extractions
+        WHERE currency = 'INR'
+          AND total IS NOT NULL
+      `),
+    ])
+
+    res.json({
+      success: true,
+      totalInvoices: Number(invoices.rows[0].total),
+      duplicatesDetected: Number(duplicates.rows[0].total),
+      totalExpenses: Number(expenses.rows[0].total),
+    })
+  } catch (error) {
+    console.error('PostgreSQL statistics error:', error)
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to retrieve statistics',
+    })
+  }
+})
+
+// Invoice history
+router.get('/invoices', async (_req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        i.id,
+        i.filename,
+        i.mime_type AS "mimeType",
+        i.file_size AS "fileSize",
+        i.uploaded_at AS "uploadedAt",
+        i.drive_file_url AS "driveFileUrl",
+        i.drive_status AS "driveStatus",
+
+        e.invoice_number AS "invoiceNumber",
+        e.invoice_date AS "invoiceDate",
+        e.vendor_name AS "vendorName",
+        e.currency,
+        e.total,
+        e.payment_status AS "paymentStatus",
+        e.financial_check_status AS "financialStatus",
+        e.extracted_at AS "extractedAt"
+
+      FROM invoices i
+      LEFT JOIN invoice_extractions e
+        ON i.id = e.invoice_id
+
+      ORDER BY i.id DESC
+      LIMIT 100
+    `)
+
+    const invoices = result.rows.map((invoice) => ({
+      ...invoice,
+      id: Number(invoice.id),
+      fileSize: Number(invoice.fileSize),
+      total:
+        invoice.total === null
+          ? null
+          : Number(invoice.total),
+    }))
+
+    res.json({
+      success: true,
+      count: invoices.length,
+      invoices,
+    })
+  } catch (error) {
+    console.error('PostgreSQL invoice history error:', error)
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to retrieve invoices',
+    })
+  }
+})
+
+// Individual invoice details
+router.get('/invoices/:id', async (req, res) => {
+  try {
+    const invoiceId = Number(req.params.id)
+
+    if (!Number.isSafeInteger(invoiceId) || invoiceId <= 0) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid invoice ID',
+      })
+      return
+    }
+
+    const result = await pool.query(
+      `
+        SELECT
+          i.id,
+          i.filename,
+          i.drive_file_url AS "driveFileUrl",
+
+          e.invoice_number AS "invoiceNumber",
+          e.invoice_date AS "invoiceDate",
+          e.due_date AS "dueDate",
+          e.vendor_name AS "vendorName",
+          e.currency,
+          e.subtotal,
+          e.tax_total AS "taxTotal",
+          e.total,
+          e.payment_status AS "paymentStatus",
+          e.category,
+          e.financial_check_status AS "financialStatus"
+
+        FROM invoices i
+        LEFT JOIN invoice_extractions e
+          ON i.id = e.invoice_id
+        WHERE i.id = $1
+      `,
+      [invoiceId]
+    )
+
+    const invoice = result.rows[0]
+
+    if (!invoice) {
+      res.status(404).json({
+        success: false,
+        error: 'Invoice not found',
+      })
+      return
+    }
+
+    res.json({
+      success: true,
+      invoice: {
+        ...invoice,
+        id: Number(invoice.id),
+        subtotal:
+          invoice.subtotal === null
+            ? null
+            : Number(invoice.subtotal),
+        taxTotal:
+          invoice.taxTotal === null
+            ? null
+            : Number(invoice.taxTotal),
+        total:
+          invoice.total === null
+            ? null
+            : Number(invoice.total),
+      },
+    })
+  } catch (error) {
+    console.error('PostgreSQL invoice details error:', error)
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to retrieve invoice',
+    })
+  }
+})
+
+export default router
