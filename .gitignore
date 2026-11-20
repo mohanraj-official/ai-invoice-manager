@@ -12,3 +12,5 @@ backend/data/
 *.db
 *.db-shm
 *.db-wal
+
+backend/test-invoice.pdf
