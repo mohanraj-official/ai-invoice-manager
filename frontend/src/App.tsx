@@ -1,7 +1,49 @@
 
+import { useEffect, useState } from 'react'
 import './App.css'
 
+type ApiStatus = 'checking' | 'connected' | 'disconnected'
+
 function App() {
+  const [apiStatus, setApiStatus] = useState<ApiStatus>('checking')
+
+  useEffect(() => {
+    const controller = new AbortController()
+
+    async function checkBackend() {
+      try {
+        const response = await fetch('/api/health', {
+          signal: controller.signal,
+        })
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`)
+        }
+
+        const data: unknown = await response.json()
+
+        if (
+          typeof data !== 'object' ||
+          data === null ||
+          !('status' in data) ||
+          data.status !== 'ok'
+        ) {
+          throw new Error('Invalid API response')
+        }
+
+        setApiStatus('connected')
+      } catch {
+        if (!controller.signal.aborted) {
+          setApiStatus('disconnected')
+        }
+      }
+    }
+
+    void checkBackend()
+
+    return () => controller.abort()
+  }, [])
+
   return (
     <div className="app">
       <header className="header">
@@ -9,7 +51,9 @@ function App() {
           <h1>AI Invoice Manager</h1>
           <p>Smart invoice extraction and expense management</p>
         </div>
-        <span className="status">Development Mode</span>
+        <span className="status">
+          Backend: {apiStatus}
+        </span>
       </header>
 
       <main>
