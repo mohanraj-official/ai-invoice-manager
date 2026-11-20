@@ -1,32 +1,25 @@
-
 import 'dotenv/config'
+
 import {
   createCipheriv,
   createDecipheriv,
   randomBytes,
 } from 'node:crypto'
+
 import {
   existsSync,
-  mkdirSync,
   readFileSync,
-  writeFileSync,
 } from 'node:fs'
-import { join } from 'node:path'
 
-const tokenPath = join(
+import { join } from 'node:path'
+import type { Credentials } from 'google-auth-library'
+import pool from '../db/postgres.js'
+
+const legacyTokenPath = join(
   process.cwd(),
   'data',
   'google-oauth.enc'
 )
-
-type GoogleTokens = {
-  access_token?: string | null
-  refresh_token?: string | null
-  expiry_date?: number | null
-  token_type?: string | null
-  scope?: string
-  id_token?: string | null
-}
 
 function getEncryptionKey(): Buffer {
   const value = process.env.GOOGLE_TOKEN_ENCRYPTION_KEY
@@ -38,15 +31,22 @@ function getEncryptionKey(): Buffer {
   return Buffer.from(value, 'hex')
 }
 
-export function saveGoogleTokens(
-  tokens: GoogleTokens
-): void {
-  const key = getEncryptionKey()
+async function ensureTokenTable(): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS google_oauth_tokens (
+      id TEXT PRIMARY KEY,
+      encrypted_payload BYTEA NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `)
+}
+
+function encryptTokens(tokens: Credentials): Buffer {
   const iv = randomBytes(12)
 
   const cipher = createCipheriv(
     'aes-256-gcm',
-    key,
+    getEncryptionKey(),
     iv
   )
 
@@ -55,33 +55,16 @@ export function saveGoogleTokens(
     cipher.final(),
   ])
 
-  const tag = cipher.getAuthTag()
-
-  const payload = Buffer.concat([
+  return Buffer.concat([
     iv,
-    tag,
+    cipher.getAuthTag(),
     encrypted,
   ])
-
-  mkdirSync(join(process.cwd(), 'data'), {
-    recursive: true,
-  })
-
-  writeFileSync(tokenPath, payload, {
-    mode: 0o600,
-  })
 }
 
-export function loadGoogleTokens(): GoogleTokens | null {
-  if (!existsSync(tokenPath)) {
-    return null
-  }
-
-  const key = getEncryptionKey()
-  const payload = readFileSync(tokenPath)
-
+function decryptTokens(payload: Buffer): Credentials {
   if (payload.length < 29) {
-    throw new Error('Invalid encrypted Google token file')
+    throw new Error('Invalid encrypted Google token payload')
   }
 
   const iv = payload.subarray(0, 12)
@@ -90,7 +73,7 @@ export function loadGoogleTokens(): GoogleTokens | null {
 
   const decipher = createDecipheriv(
     'aes-256-gcm',
-    key,
+    getEncryptionKey(),
     iv
   )
 
@@ -101,5 +84,62 @@ export function loadGoogleTokens(): GoogleTokens | null {
     decipher.final(),
   ])
 
-  return JSON.parse(decrypted.toString('utf8')) as GoogleTokens
+  return JSON.parse(decrypted.toString('utf8')) as Credentials
+}
+
+export async function saveGoogleTokens(
+  tokens: Credentials
+): Promise<void> {
+  await ensureTokenTable()
+
+  const encrypted = encryptTokens(tokens)
+
+  await pool.query(
+    `
+      INSERT INTO google_oauth_tokens (
+        id,
+        encrypted_payload
+      )
+      VALUES ($1, $2)
+      ON CONFLICT (id)
+      DO UPDATE SET
+        encrypted_payload = EXCLUDED.encrypted_payload,
+        updated_at = NOW()
+    `,
+    ['workspace', encrypted]
+  )
+}
+
+export async function loadGoogleTokens(): Promise<Credentials | null> {
+  await ensureTokenTable()
+
+  const result = await pool.query<{
+    encrypted_payload: Buffer
+  }>(
+    `
+      SELECT encrypted_payload
+      FROM google_oauth_tokens
+      WHERE id = $1
+    `,
+    ['workspace']
+  )
+
+  if (result.rows[0]) {
+    return decryptTokens(result.rows[0].encrypted_payload)
+  }
+
+  // One-time migration from existing Codespaces storage.
+  if (existsSync(legacyTokenPath)) {
+    const legacyTokens = decryptTokens(
+      readFileSync(legacyTokenPath)
+    )
+
+    await saveGoogleTokens(legacyTokens)
+
+    console.log('Google authorization migrated to PostgreSQL')
+
+    return legacyTokens
+  }
+
+  return null
 }

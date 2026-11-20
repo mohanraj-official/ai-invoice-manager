@@ -1,54 +1,43 @@
-
 import { Router } from 'express'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
+import 'express-session'
+
 import {
   googleOAuthClient,
   getGoogleAuthUrl,
 } from '../services/googleAuth.js'
 
-const router = Router()
+import { saveGoogleTokens } from '../services/googleTokenStorage.js'
 
-const STATE_COOKIE = 'invoice_oauth_state'
-const STATE_TTL_MS = 10 * 60 * 1000
-
-const pendingStates = new Map<string, number>()
-
-function readCookie(
-  cookieHeader: string | undefined,
-  name: string
-): string | undefined {
-  const cookies = (cookieHeader ?? '').split(';')
-
-  for (const cookie of cookies) {
-    const separator = cookie.indexOf('=')
-
-    if (separator === -1) continue
-
-    const key = cookie.slice(0, separator).trim()
-    const value = cookie.slice(separator + 1).trim()
-
-    if (key === name) {
-      return value
+declare module 'express-session' {
+  interface SessionData {
+    googleAuthorization?: {
+      state: string
+      expiresAt: number
     }
   }
-
-  return undefined
 }
 
-router.get('/login', (_req, res) => {
+const router = Router()
+
+const STATE_TTL_MS = 10 * 60 * 1000
+
+router.get('/login', (req, res) => {
   const state = randomBytes(32).toString('hex')
 
-  pendingStates.set(state, Date.now() + STATE_TTL_MS)
+  req.session.googleAuthorization = {
+    state,
+    expiresAt: Date.now() + STATE_TTL_MS,
+  }
 
-  res.cookie(STATE_COOKIE, state, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: false, // Localhost development only
-    maxAge: STATE_TTL_MS,
-    path: '/api/auth/google',
+  req.session.save((error) => {
+    if (error) {
+      res.status(500).send('Unable to start Google authorization')
+      return
+    }
+
+    res.redirect(getGoogleAuthUrl(state))
   })
-
-  res.redirect(getGoogleAuthUrl(state))
 })
 
 router.get('/callback', async (req, res) => {
@@ -62,34 +51,23 @@ router.get('/callback', async (req, res) => {
       ? req.query.code
       : ''
 
-  const cookieState = readCookie(
-    req.headers.cookie,
-    STATE_COOKIE
-  )
+  const pending = req.session.googleAuthorization
 
-  res.clearCookie(STATE_COOKIE, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: false,
-    path: '/api/auth/google',
-  })
-
-  const expiresAt = pendingStates.get(state)
-  pendingStates.delete(state)
+  delete req.session.googleAuthorization
 
   const stateMatches =
+    Boolean(pending) &&
     state.length > 0 &&
-    cookieState !== undefined &&
-    state.length === cookieState.length &&
+    state.length === pending!.state.length &&
     timingSafeEqual(
       Buffer.from(state),
-      Buffer.from(cookieState)
+      Buffer.from(pending!.state)
     )
 
   if (
     !stateMatches ||
-    !expiresAt ||
-    Date.now() > expiresAt ||
+    !pending ||
+    Date.now() > pending.expiresAt ||
     !code
   ) {
     res.status(400).send('Invalid or expired authorization request')
@@ -97,17 +75,41 @@ router.get('/callback', async (req, res) => {
   }
 
   try {
+    const previous = googleOAuthClient.credentials
+
     const { tokens } = await googleOAuthClient.getToken(code)
 
-    googleOAuthClient.setCredentials(tokens)
+    const updated = {
+      ...previous,
+      ...tokens,
+      refresh_token:
+        tokens.refresh_token ??
+        previous.refresh_token ??
+        null,
+    }
 
-    console.log('Google OAuth authorization succeeded')
+    // Persist before accepting the authorization.
+    await saveGoogleTokens(updated)
+
+    googleOAuthClient.setCredentials(updated)
+
+    await new Promise<void>((resolve, reject) => {
+      req.session.save((error) => {
+        if (error) reject(error)
+        else resolve()
+      })
+    })
+
+    console.log('Google authorization saved successfully')
 
     res.status(200).send(
       'Google authorization successful. You can close this tab.'
     )
   } catch (error) {
-    console.error('Google OAuth exchange failed')
+    console.error(
+      'Google authorization failed:',
+      error instanceof Error ? error.message : 'Unknown error'
+    )
 
     res.status(500).send(
       'Google authorization failed. Please retry.'

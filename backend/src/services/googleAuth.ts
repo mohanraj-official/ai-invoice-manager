@@ -1,5 +1,5 @@
-
 import 'dotenv/config'
+
 import { google } from 'googleapis'
 
 import {
@@ -12,9 +12,7 @@ const clientSecret = process.env.GOOGLE_CLIENT_SECRET
 const redirectUri = process.env.GOOGLE_REDIRECT_URI
 
 if (!clientId || !clientSecret || !redirectUri) {
-  throw new Error(
-    'Google OAuth credentials are missing from backend/.env'
-  )
+  throw new Error('Google OAuth credentials are missing')
 }
 
 export const googleOAuthClient = new google.auth.OAuth2(
@@ -23,31 +21,37 @@ export const googleOAuthClient = new google.auth.OAuth2(
   redirectUri
 )
 
-// Restore previously saved authorization
-const savedTokens = loadGoogleTokens()
+export async function initializeGoogleAuthorization(): Promise<void> {
+  const savedTokens = await loadGoogleTokens()
 
-if (savedTokens) {
-  googleOAuthClient.setCredentials(savedTokens)
-  console.log('Saved Google authorization restored')
-}
-
-// Save refreshed Google tokens
-googleOAuthClient.on('tokens', (tokens) => {
-  const current = googleOAuthClient.credentials
-
-  const updated = {
-    ...current,
-    ...tokens,
-    refresh_token:
-      tokens.refresh_token ??
-      current.refresh_token ??
-      savedTokens?.refresh_token ??
-      null,
+  if (savedTokens) {
+    googleOAuthClient.setCredentials(savedTokens)
+    console.log('Google authorization restored from PostgreSQL')
   }
 
-  googleOAuthClient.setCredentials(updated)
-  saveGoogleTokens(updated)
-})
+  googleOAuthClient.on('tokens', (tokens) => {
+    const current = googleOAuthClient.credentials
+
+    const updated = {
+      ...current,
+      ...tokens,
+      refresh_token:
+        tokens.refresh_token ??
+        current.refresh_token ??
+        savedTokens?.refresh_token ??
+        null,
+    }
+
+    googleOAuthClient.setCredentials(updated)
+
+    void saveGoogleTokens(updated).catch((error) => {
+      console.error(
+        'Failed to persist refreshed Google authorization:',
+        error instanceof Error ? error.message : 'Unknown error'
+      )
+    })
+  })
+}
 
 export const GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/drive.file',

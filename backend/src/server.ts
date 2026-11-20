@@ -1,10 +1,11 @@
 import 'dotenv/config'
-
+import { initializeGoogleAuthorization } from './services/googleAuth.js'
 import express from 'express'
 import cors from 'cors'
 import session from 'express-session'
-import connectSqlite3 from 'connect-sqlite3'
-import { join } from 'node:path'
+import connectPgSimple from 'connect-pg-simple'
+
+import pool from './db/postgres.js'
 
 import postgresUploadRouter from './routes/postgresUpload.js'
 import postgresInvoicesRouter from './routes/postgresInvoices.js'
@@ -30,9 +31,13 @@ const frontendOrigin =
 const sessionSecret = process.env.SESSION_SECRET
 
 if (!sessionSecret || sessionSecret.length < 32) {
-  throw new Error('SESSION_SECRET is missing or too short')
+  throw new Error(
+    'SESSION_SECRET must contain at least 32 characters'
+  )
 }
 
+// Trust the first proxy in production.
+// Required when deployed behind a trusted HTTPS proxy.
 if (isProduction) {
   app.set('trust proxy', 1)
 }
@@ -49,38 +54,51 @@ app.use(
   })
 )
 
-app.use(express.json({ limit: '1mb' }))
-
 // -----------------------------------------
-// 3. Session configuration
+// 3. Request body configuration
 // -----------------------------------------
 
-const SQLiteStore = connectSqlite3(session)
+app.use(
+  express.json({
+    limit: '1mb',
+  })
+)
+
+// -----------------------------------------
+// 4. PostgreSQL session configuration
+// -----------------------------------------
+
+const PostgresStore = connectPgSimple(session)
 
 app.use(
   session({
-    store: new SQLiteStore({
-      db: 'sessions.sqlite',
-      dir: join(process.cwd(), 'data'),
-    }) as unknown as session.Store,
+    store: new PostgresStore({
+      pool,
+      tableName: 'user_sessions',
+      createTableIfMissing: true,
+      pruneSessionInterval: 60 * 15,
+    }),
 
     name: 'invoice.sid',
+
     secret: sessionSecret,
 
     resave: false,
     saveUninitialized: false,
+    rolling: false,
 
     cookie: {
       httpOnly: true,
       secure: isProduction,
       sameSite: 'lax',
       maxAge: 8 * 60 * 60 * 1000,
+      path: '/',
     },
   })
 )
 
 // -----------------------------------------
-// 4. Health check API
+// 5. Health check API
 // -----------------------------------------
 
 app.get('/api/health', (_req, res) => {
@@ -91,12 +109,18 @@ app.get('/api/health', (_req, res) => {
 })
 
 // -----------------------------------------
-// 5. User authentication
+// 6. User authentication
 // -----------------------------------------
 
-app.use('/api/auth/user', userAuthRouter)
+app.use(
+  '/api/auth/user',
+  userAuthRouter
+)
 
-// Only admins can authorize Google Drive / Sheets
+// -----------------------------------------
+// 7. Admin-only Google authorization
+// -----------------------------------------
+
 app.use(
   '/api/auth/google',
   requireAuth,
@@ -105,7 +129,7 @@ app.use(
 )
 
 // -----------------------------------------
-// 6. Protected PostgreSQL upload API
+// 8. Protected invoice upload API
 // -----------------------------------------
 
 app.use(
@@ -115,7 +139,7 @@ app.use(
 )
 
 // -----------------------------------------
-// 7. Protected PostgreSQL dashboard APIs
+// 9. Protected invoice dashboard APIs
 // -----------------------------------------
 
 app.use(
@@ -125,9 +149,55 @@ app.use(
 )
 
 // -----------------------------------------
-// 8. Start backend
+// 10. API error handler
+// -----------------------------------------
+
+app.use(
+  (
+    error: unknown,
+    _req: express.Request,
+    res: express.Response,
+    _next: express.NextFunction
+  ) => {
+    console.error('API error:', error)
+
+    if (res.headersSent) {
+      _next(error)
+      return
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+    })
+  }
+)
+
+// -----------------------------------------
+// 11. Start backend server
 // -----------------------------------------
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Backend running on port ${PORT}`)
 })
+
+
+
+async function startServer() {
+  try {
+    await initializeGoogleAuthorization()
+
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Backend running on port ${PORT}`)
+    })
+  } catch (error) {
+    console.error(
+      'Backend startup failed:',
+      error instanceof Error ? error.message : 'Unknown error'
+    )
+
+    process.exitCode = 1
+  }
+}
+
+void startServer()
