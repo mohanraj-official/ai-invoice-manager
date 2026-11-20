@@ -4,15 +4,21 @@ import './App.css'
 
 type ApiStatus = 'checking' | 'connected' | 'disconnected'
 
+
 type UploadedFile = {
   filename: string
   size: number
   mimeType: string
   sha256: string
+  duplicate: boolean
+  invoiceId: number
 }
+
 
 function App() {
   const [apiStatus, setApiStatus] = useState<ApiStatus>('checking')
+  const [totalInvoices, setTotalInvoices] = useState<number | null>(null)
+  const [duplicatesDetected, setDuplicatesDetected] = useState<number | null>(null)
   const [files, setFiles] = useState<File[]>([])
   const [uploading, setUploading] = useState(false)
   const [message, setMessage] = useState('')
@@ -39,6 +45,42 @@ function App() {
     return () => controller.abort()
   }, [])
 
+
+  useEffect(() => {
+    const controller = new AbortController()
+
+    async function loadStats() {
+      try {
+        const response = await fetch('/api/stats', {
+          signal: controller.signal,
+        })
+
+        if (!response.ok) {
+          throw new Error('Failed to load statistics')
+        }
+
+        const data: {
+          totalInvoices: number
+          duplicatesDetected: number
+        } = await response.json()
+
+        if (!controller.signal.aborted) {
+          setTotalInvoices(data.totalInvoices)
+          setDuplicatesDetected(data.duplicatesDetected)
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          console.error('Statistics request failed:', error)
+        }
+      }
+    }
+
+    void loadStats()
+
+    return () => controller.abort()
+  }, [])
+
+
   async function handleUpload() {
     if (files.length === 0 || uploading) return
 
@@ -61,6 +103,18 @@ function App() {
       }
 
       setUploadedFiles(data.files)
+
+      const statsResponse = await fetch('/api/stats')
+
+      if (statsResponse.ok) {
+        const stats: {
+          totalInvoices: number
+          duplicatesDetected: number
+        } = await statsResponse.json()
+        setTotalInvoices(stats.totalInvoices)
+        setDuplicatesDetected(stats.duplicatesDetected)
+      }
+
       setMessage(`${data.count} file(s) processed successfully`)
       setFiles([])
     } catch (error) {
@@ -84,7 +138,7 @@ function App() {
         <section className="stats">
           <div className="stat-card">
             <h3>Total Invoices</h3>
-            <strong>0</strong>
+            <strong>{totalInvoices ?? '—'}</strong>
           </div>
           <div className="stat-card">
             <h3>Total Expenses</h3>
@@ -92,7 +146,7 @@ function App() {
           </div>
           <div className="stat-card">
             <h3>Duplicates Detected</h3>
-            <strong>0</strong>
+            <strong>{duplicatesDetected ?? '—'}</strong>
           </div>
         </section>
 
@@ -126,13 +180,27 @@ function App() {
           {uploadedFiles.length === 0 ? (
             <p>No files processed yet.</p>
           ) : (
+
             <ul>
               {uploadedFiles.map((file, index) => (
                 <li key={`${file.sha256}-${index}`}>
-                  {file.filename} ({(file.size / 1024).toFixed(1)} KB)
+                  <strong>{file.filename}</strong>
+                  {' '}
+                  ({(file.size / 1024).toFixed(1)} KB)
+                  {' — '}
+                  {file.duplicate ? (
+                    <span style={{ color: '#d97706' }}>
+                      Duplicate detected (Invoice #{file.invoiceId})
+                    </span>
+                  ) : (
+                    <span style={{ color: '#16a34a' }}>
+                      New invoice (ID: {file.invoiceId})
+                    </span>
+                  )}
                 </li>
               ))}
             </ul>
+
           )}
         </section>
       </main>

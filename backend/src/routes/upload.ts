@@ -1,4 +1,4 @@
-
+import db from '../db/database.js'
 import { Router } from 'express'
 import multer from 'multer'
 import { fileTypeFromBuffer } from 'file-type'
@@ -54,12 +54,57 @@ router.post('/', (req, res) => {
           .update(file.buffer)
           .digest('hex')
 
+
+        const existing = db
+          .prepare('SELECT id FROM invoices WHERE sha256 = ?')
+          .get(hash) as { id: number } | undefined
+
+        if (existing) {
+
+          db.prepare(`
+  INSERT INTO upload_events (invoice_id, is_duplicate)
+  VALUES (?, ?)
+`).run(existing.id, 1)
+
+          results.push({
+            filename: file.originalname,
+            size: file.size,
+            mimeType: detected.mime,
+            sha256: hash,
+            duplicate: true,
+            invoiceId: existing.id,
+          })
+          continue
+        }
+
+        const insert = db.prepare(`
+  INSERT INTO invoices (filename, mime_type, file_size, sha256)
+  VALUES (?, ?, ?, ?)
+`)
+
+        const result = insert.run(
+          file.originalname,
+          detected.mime,
+          file.size,
+          hash
+        )
+
+
+        db.prepare(`
+  INSERT INTO upload_events (invoice_id, is_duplicate)
+  VALUES (?, ?)
+`).run(Number(result.lastInsertRowid), 0)
+
+
         results.push({
           filename: file.originalname,
           size: file.size,
           mimeType: detected.mime,
           sha256: hash,
+          duplicate: false,
+          invoiceId: Number(result.lastInsertRowid),
         })
+
       }
 
       res.json({
