@@ -4,8 +4,19 @@ import './App.css'
 
 type ApiStatus = 'checking' | 'connected' | 'disconnected'
 
+type UploadedFile = {
+  filename: string
+  size: number
+  mimeType: string
+  sha256: string
+}
+
 function App() {
   const [apiStatus, setApiStatus] = useState<ApiStatus>('checking')
+  const [files, setFiles] = useState<File[]>([])
+  const [uploading, setUploading] = useState(false)
+  const [message, setMessage] = useState('')
+  const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -15,34 +26,49 @@ function App() {
         const response = await fetch('/api/health', {
           signal: controller.signal,
         })
+        if (!response.ok) throw new Error('Backend unavailable')
 
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`)
-        }
-
-        const data: unknown = await response.json()
-
-        if (
-          typeof data !== 'object' ||
-          data === null ||
-          !('status' in data) ||
-          data.status !== 'ok'
-        ) {
-          throw new Error('Invalid API response')
-        }
-
-        setApiStatus('connected')
+        const data = await response.json()
+        setApiStatus(data.status === 'ok' ? 'connected' : 'disconnected')
       } catch {
-        if (!controller.signal.aborted) {
-          setApiStatus('disconnected')
-        }
+        if (!controller.signal.aborted) setApiStatus('disconnected')
       }
     }
 
     void checkBackend()
-
     return () => controller.abort()
   }, [])
+
+  async function handleUpload() {
+    if (files.length === 0 || uploading) return
+
+    setUploading(true)
+    setMessage('')
+
+    try {
+      const formData = new FormData()
+      files.forEach((file) => formData.append('files', file))
+
+      const response = await fetch('/api/upload', {
+        method: 'POST',
+        body: formData,
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Upload failed')
+      }
+
+      setUploadedFiles(data.files)
+      setMessage(`${data.count} file(s) processed successfully`)
+      setFiles([])
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Upload failed')
+    } finally {
+      setUploading(false)
+    }
+  }
 
   return (
     <div className="app">
@@ -51,9 +77,7 @@ function App() {
           <h1>AI Invoice Manager</h1>
           <p>Smart invoice extraction and expense management</p>
         </div>
-        <span className="status">
-          Backend: {apiStatus}
-        </span>
+        <span className="status">Backend: {apiStatus}</span>
       </header>
 
       <main>
@@ -74,21 +98,42 @@ function App() {
 
         <section className="upload-card">
           <h2>Upload Invoices</h2>
-          <p>Upload PDF, JPG, or PNG invoices for AI processing.</p>
+          <p>Select up to 10 PDF, JPG, or PNG files (maximum 10 MB each).</p>
+
           <input
             type="file"
             accept=".pdf,.jpg,.jpeg,.png"
             multiple
-            disabled
+            onChange={(event) => {
+              setFiles(Array.from(event.target.files ?? []))
+              setMessage('')
+            }}
           />
-          <p className="note">
-            File processing will be enabled after backend integration.
-          </p>
+
+          <button
+            type="button"
+            disabled={files.length === 0 || uploading}
+            onClick={() => void handleUpload()}
+          >
+            {uploading ? 'Processing...' : 'Upload Files'}
+          </button>
+
+          {message && <p>{message}</p>}
         </section>
 
         <section className="upload-card">
-          <h2>Recent Invoices</h2>
-          <p>No invoices uploaded yet.</p>
+          <h2>Recent Upload Results</h2>
+          {uploadedFiles.length === 0 ? (
+            <p>No files processed yet.</p>
+          ) : (
+            <ul>
+              {uploadedFiles.map((file, index) => (
+                <li key={`${file.sha256}-${index}`}>
+                  {file.filename} ({(file.size / 1024).toFixed(1)} KB)
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
       </main>
     </div>
