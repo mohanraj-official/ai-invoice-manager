@@ -1,4 +1,4 @@
-
+import { saveInvoiceToSheet } from '../services/googleSheets.js'
 import db from '../db/database.js'
 import { Router } from 'express'
 import multer from 'multer'
@@ -210,6 +210,38 @@ router.post('/', (req, res) => {
               extracted,
               financialStatus
             )
+
+
+try {
+  const driveRecord = db.prepare(`
+    SELECT drive_file_id, drive_file_url
+    FROM invoices
+    WHERE id = ?
+  `).get(invoiceId) as {
+    drive_file_id: string | null
+    drive_file_url: string | null
+  } | undefined
+
+  if (driveRecord?.drive_file_id && driveRecord.drive_file_url) {
+    await saveInvoiceToSheet(
+      invoiceId,
+      extracted,
+      financialStatus,
+      driveRecord.drive_file_id,
+      driveRecord.drive_file_url
+    )
+
+    console.log(`Invoice ${invoiceId} synced to Google Sheets`)
+  }
+} catch (sheetError) {
+  console.error(
+    `Google Sheets sync failed for invoice ${invoiceId}:`,
+    sheetError instanceof Error
+      ? sheetError.message
+      : 'Unknown error'
+  )
+}
+
 
             extractionStatus = 'completed'
 
