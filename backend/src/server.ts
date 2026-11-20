@@ -1,30 +1,93 @@
-
 import 'dotenv/config'
-
+import { requireAdmin } from './middleware/requireAdmin.js'
 import express from 'express'
 import cors from 'cors'
+import session from 'express-session'
+import connectSqlite3 from 'connect-sqlite3'
+import { join } from 'node:path'
 
 import db from './db/database.js'
+
 import uploadRouter from './routes/upload.js'
 import googleAuthRouter from './routes/googleAuth.js'
+import userAuthRouter from './routes/userAuth.js'
+
+import { requireAuth } from './middleware/requireAuth.js'
 
 // -----------------------------------------
-// 1. Express application configuration
+// 1. Application configuration
 // -----------------------------------------
 
 const app = express()
+
 const PORT = Number(process.env.PORT) || 3001
+const isProduction = process.env.NODE_ENV === 'production'
+
+const frontendOrigin =
+  process.env.FRONTEND_ORIGIN || 'http://localhost:5173'
+
+const sessionSecret = process.env.SESSION_SECRET
+
+if (!sessionSecret || sessionSecret.length < 32) {
+  throw new Error(
+    'SESSION_SECRET must contain at least 32 characters'
+  )
+}
+
+// Required when running behind a trusted cloud proxy
+if (isProduction) {
+  app.set('trust proxy', 1)
+}
+
+// -----------------------------------------
+// 2. CORS configuration
+// -----------------------------------------
 
 app.use(
   cors({
-    origin: 'http://localhost:5173',
+    origin: frontendOrigin,
+    credentials: true,
+    methods: ['GET', 'POST', 'OPTIONS'],
   })
 )
 
-app.use(express.json({ limit: '1mb' }))
+app.use(
+  express.json({
+    limit: '1mb',
+  })
+)
 
 // -----------------------------------------
-// 2. Health check API
+// 3. Session configuration
+// -----------------------------------------
+
+const SQLiteStore = connectSqlite3(session)
+
+app.use(
+  session({
+    store: new SQLiteStore({
+      db: 'sessions.sqlite',
+      dir: join(process.cwd(), 'data'),
+    }) as unknown as session.Store,
+
+    name: 'invoice.sid',
+
+    secret: sessionSecret,
+
+    resave: false,
+    saveUninitialized: false,
+
+    cookie: {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: 'lax',
+      maxAge: 8 * 60 * 60 * 1000,
+    },
+  })
+)
+
+// -----------------------------------------
+// 4. Health check
 // -----------------------------------------
 
 app.get('/api/health', (_req, res) => {
@@ -35,16 +98,29 @@ app.get('/api/health', (_req, res) => {
 })
 
 // -----------------------------------------
-// 3. Invoice upload API
+// 5. User authentication
 // -----------------------------------------
 
-app.use('/api/upload', uploadRouter)
+app.use('/api/auth/user', userAuthRouter)
+
+// Existing Google Drive / Sheets authorization
+app.use('/api/auth/google', requireAuth, requireAdmin, googleAuthRouter)
 
 // -----------------------------------------
-// 4. Dashboard statistics API
+// 6. Protected invoice upload
 // -----------------------------------------
 
-app.get('/api/stats', (_req, res) => {
+app.use(
+  '/api/upload',
+  requireAuth,
+  uploadRouter
+)
+
+// -----------------------------------------
+// 7. Protected dashboard statistics
+// -----------------------------------------
+
+app.get('/api/stats', requireAuth, (_req, res) => {
   try {
     const invoices = db
       .prepare(`
@@ -88,10 +164,10 @@ app.get('/api/stats', (_req, res) => {
 })
 
 // -----------------------------------------
-// 5. Invoice history API
+// 8. Protected invoice history
 // -----------------------------------------
 
-app.get('/api/invoices', (_req, res) => {
+app.get('/api/invoices', requireAuth, (_req, res) => {
   try {
     const invoices = db
       .prepare(`
@@ -102,7 +178,7 @@ app.get('/api/invoices', (_req, res) => {
           i.file_size AS fileSize,
           i.uploaded_at AS uploadedAt,
           i.drive_file_url AS driveFileUrl,
-          i.drive_status AS driveStatus,      
+          i.drive_status AS driveStatus,
 
           e.invoice_number AS invoiceNumber,
           e.invoice_date AS invoiceDate,
@@ -139,13 +215,76 @@ app.get('/api/invoices', (_req, res) => {
 })
 
 // -----------------------------------------
-// 6. Google OAuth authentication
+// 9. Protected individual invoice details
 // -----------------------------------------
 
-app.use('/api/auth/google', googleAuthRouter)
+app.get('/api/invoices/:id', requireAuth, (req, res) => {
+  try {
+    const invoiceId = Number(req.params.id)
+
+    if (
+      !Number.isSafeInteger(invoiceId) ||
+      invoiceId <= 0
+    ) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid invoice ID',
+      })
+      return
+    }
+
+    const invoice = db
+      .prepare(`
+        SELECT
+          i.id,
+          i.filename,
+          i.drive_file_url AS driveFileUrl,
+
+          e.invoice_number AS invoiceNumber,
+          e.invoice_date AS invoiceDate,
+          e.due_date AS dueDate,
+          e.vendor_name AS vendorName,
+          e.currency,
+          e.subtotal,
+          e.tax_total AS taxTotal,
+          e.total,
+          e.payment_status AS paymentStatus,
+          e.category,
+          e.financial_check_status AS financialStatus
+
+        FROM invoices i
+
+        LEFT JOIN invoice_extractions e
+          ON i.id = e.invoice_id
+
+        WHERE i.id = ?
+      `)
+      .get(invoiceId)
+
+    if (!invoice) {
+      res.status(404).json({
+        success: false,
+        error: 'Invoice not found',
+      })
+      return
+    }
+
+    res.json({
+      success: true,
+      invoice,
+    })
+  } catch (error) {
+    console.error('Invoice details error:', error)
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to retrieve invoice',
+    })
+  }
+})
 
 // -----------------------------------------
-// 7. Start backend server
+// 10. Start backend
 // -----------------------------------------
 
 app.listen(PORT, '0.0.0.0', () => {
