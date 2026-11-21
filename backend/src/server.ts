@@ -1,3 +1,5 @@
+import { startSheetSyncWorker } from './services/sheetSyncWorker.js'
+
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import 'dotenv/config'
@@ -216,6 +218,7 @@ app.use(
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Backend running on port ${PORT}`)
+  startSheetSyncWorker()
 })
 
 
