@@ -1,3 +1,5 @@
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import 'dotenv/config'
 import { initializeGoogleAuthorization } from './services/googleAuth.js'
 import express from 'express'
@@ -147,6 +149,41 @@ app.use(
   requireAuth,
   postgresInvoicesRouter
 )
+
+
+// -----------------------------------------
+// Serve React frontend in production
+// -----------------------------------------
+
+if (isProduction) {
+  const currentDirectory = dirname(fileURLToPath(import.meta.url))
+
+  const frontendDist = join(
+    currentDirectory,
+    '../../frontend/dist'
+  )
+
+  app.use(express.static(frontendDist))
+
+  app.use((req, res, next) => {
+    if (req.path === '/api' || req.path.startsWith('/api/')) {
+      res.status(404).json({
+        success: false,
+        error: 'API endpoint not found',
+      })
+      return
+    }
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      next()
+      return
+    }
+
+    res.sendFile(join(frontendDist, 'index.html'))
+  })
+}
+
+
 
 // -----------------------------------------
 // 10. API error handler
