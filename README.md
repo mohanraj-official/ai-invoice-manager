@@ -4,8 +4,6 @@
 
 ### AI-Powered Invoice Processing · Data Automation · Expense Intelligence
 
-**Turning invoice documents into structured, searchable financial data through a secure, automated workflow.**
-
 [![Live Application](https://img.shields.io/badge/LIVE_APPLICATION-Open_Dashboard-2563EB?style=for-the-badge&logo=render&logoColor=white)](https://ai-invoice-manager-rxj7.onrender.com)
 [![Source Code](https://img.shields.io/badge/GITHUB-Source_Code-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/mohanraj-official/ai-invoice-manager)
 
@@ -34,8 +32,6 @@
 ![GitHub](https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white)
 
 </div>
-
----
 
 ## Project Overview
 
