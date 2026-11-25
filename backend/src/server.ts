@@ -13,6 +13,7 @@ import pool from './db/postgres.js'
 
 import postgresUploadRouter from './routes/postgresUpload.js'
 import postgresInvoicesRouter from './routes/postgresInvoices.js'
+import paymentReconciliationRouter from './routes/paymentReconciliation.js'
 
 import googleAuthRouter from './routes/googleAuth.js'
 import userAuthRouter from './routes/userAuth.js'
@@ -149,7 +150,8 @@ app.use(
 app.use(
   '/api',
   requireAuth,
-  postgresInvoicesRouter
+  postgresInvoicesRouter,
+  paymentReconciliationRouter
 )
 
 

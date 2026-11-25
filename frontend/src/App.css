@@ -97,3 +97,13 @@
 .document-filters { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
 .document-filters label { display: grid; gap: 4px; font-size: 14px; }
 .document-filters input, .document-filters select { border: 1px solid #94a3b8; border-radius: 6px; padding: 8px; font: inherit; }
+
+.payment-section { scroll-margin-top: 20px; }
+.payment-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.payment-toolbar .upload-action { margin: 0; }
+.payment-form { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin: 16px 0; }
+.payment-form fieldset { border: 1px solid #cbd5e1; border-radius: 6px; margin: 0 0 12px; }
+.payment-allocation { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; padding: 8px 0; }
+.payment-allocation input { width: 110px; }
+.payment-record { padding: 14px 0; border-top: 1px solid #e2e8f0; margin-top: 12px; }
+.payment-record p { margin: 6px 0; }

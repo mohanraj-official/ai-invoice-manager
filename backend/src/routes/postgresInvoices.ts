@@ -6,7 +6,7 @@ const router = Router()
 // Dashboard statistics
 router.get('/stats', async (_req, res) => {
   try {
-    const [invoices, duplicates, expenses, documentTotals] = await Promise.all([
+    const [invoices, duplicates, expenses, documentTotals, balances] = await Promise.all([
       pool.query('SELECT COUNT(*) AS total FROM invoices'),
 
       pool.query(`
@@ -29,6 +29,19 @@ router.get('/stats', async (_req, res) => {
         GROUP BY document_type, currency
         ORDER BY currency
       `),
+      pool.query(`
+        WITH paid AS (
+          SELECT a.invoice_id, SUM(a.amount) AS amount
+          FROM invoice_payment_allocations a
+          JOIN invoice_payments p ON p.id = a.payment_id
+          WHERE p.verified_at IS NOT NULL
+          GROUP BY a.invoice_id
+        )
+        SELECT e.currency, SUM(e.total) AS billed, SUM(COALESCE(paid.amount, 0)) AS paid
+        FROM invoice_extractions e LEFT JOIN paid ON paid.invoice_id = e.invoice_id
+        WHERE e.document_type = 'invoice' AND e.currency ~ '^[A-Z]{3}$' AND e.total IS NOT NULL
+        GROUP BY e.currency ORDER BY e.currency
+      `),
     ])
 
     res.json({
@@ -36,6 +49,7 @@ router.get('/stats', async (_req, res) => {
       totalInvoices: Number(invoices.rows[0].total),
       duplicatesDetected: Number(duplicates.rows[0].total),
       totalExpenses: Number(expenses.rows[0].total),
+      balances: balances.rows,
       documentTotals: documentTotals.rows.map((row) => ({
         documentType: row.document_type,
         currency: row.currency,
@@ -68,9 +82,13 @@ router.get('/invoices', async (_req, res) => {
         e.document_type AS "documentType",
         e.invoice_number AS "invoiceNumber",
         e.invoice_date AS "invoiceDate",
+        e.due_date AS "dueDate",
         e.vendor_name AS "vendorName",
         e.currency,
         e.total,
+        COALESCE(applied.paid, 0) AS "confirmedPaid",
+        COALESCE(applied.reported, 0) AS "reportedPaid",
+        COALESCE(applied.has_receipt, false) AS "hasReceipt",
         e.payment_status AS "paymentStatus",
         e.financial_check_status AS "financialStatus",
         e.extracted_at AS "extractedAt"
@@ -78,6 +96,17 @@ router.get('/invoices', async (_req, res) => {
       FROM invoices i
       LEFT JOIN invoice_extractions e
         ON i.id = e.invoice_id
+
+      LEFT JOIN LATERAL (
+        SELECT SUM(a.amount) FILTER (WHERE p.verified_at IS NOT NULL) AS paid,
+          SUM(a.amount) FILTER (WHERE p.verified_at IS NULL) AS reported,
+          BOOL_AND(EXISTS (
+            SELECT 1 FROM invoice_payment_receipts r WHERE r.payment_id = p.id
+          )) FILTER (WHERE p.verified_at IS NOT NULL) AS has_receipt
+        FROM invoice_payment_allocations a
+        JOIN invoice_payments p ON p.id = a.payment_id
+        WHERE a.invoice_id = i.id
+      ) applied ON true
 
       ORDER BY i.id DESC
       LIMIT 100

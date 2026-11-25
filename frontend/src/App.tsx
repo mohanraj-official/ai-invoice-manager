@@ -1,6 +1,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import './App.css'
+import Payments, { formatPaymentAmount } from './Payments'
 
 type ApiStatus = 'checking' | 'connected' | 'disconnected'
 
@@ -29,9 +30,13 @@ type InvoiceHistoryItem = {
   documentType: 'invoice' | 'receipt' | 'unknown' | null
   invoiceNumber: string | null
   invoiceDate: string | null
+  dueDate: string | null
   vendorName: string | null
   currency: string | null
   total: number | null
+  confirmedPaid: string
+  reportedPaid: string
+  hasReceipt: boolean
   paymentStatus: string | null
   financialStatus: string | null
   extractedAt: string | null
@@ -46,6 +51,7 @@ type DashboardStats = {
   success: boolean
   totalInvoices: number
   documentTotals: DocumentTotal[]
+  balances: { currency: string; billed: string; paid: string }[]
   duplicatesDetected: number
 }
 
@@ -78,6 +84,12 @@ function App() {
     useState<number | null>(null)
 
   const [documentTotals, setDocumentTotals] = useState<DocumentTotal[]>([])
+  const [balances, setBalances] = useState<DashboardStats['balances']>([])
+  const [paymentInvoice, setPaymentInvoice] = useState<InvoiceHistoryItem | null>(null)
+  const [vendorSearch, setVendorSearch] = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const [overdueOnly, setOverdueOnly] = useState(false)
   const [documentFilter, setDocumentFilter] = useState('all')
   const [currencyFilter, setCurrencyFilter] = useState('all')
   const [search, setSearch] = useState('')
@@ -100,6 +112,7 @@ function App() {
 
     setTotalInvoices(stats.totalInvoices)
     setDocumentTotals(stats.documentTotals ?? [])
+    setBalances(stats.balances ?? [])
     setDuplicatesDetected(stats.duplicatesDetected)
   }
 
@@ -345,10 +358,16 @@ function App() {
 
   const query = search.trim().toLowerCase()
   const currencies = [...new Set([...documentTotals.map((entry) => entry.currency), ...invoiceHistory.flatMap((entry) => entry.currency ? [entry.currency] : [])])].sort()
+  const today = new Date().toLocaleDateString('sv-SE')
   const visibleDocuments = invoiceHistory.filter((entry) => {
-    const needsReview = !entry.documentType || entry.documentType === 'unknown' || !entry.currency || entry.financialStatus === 'mismatch'
+    const needsReview = !entry.documentType || entry.documentType === 'unknown' || !entry.currency || entry.financialStatus === 'mismatch' || Number(entry.reportedPaid) > 0
     return (documentFilter === 'all' || (documentFilter === 'review' ? needsReview : entry.documentType === documentFilter)) &&
       (currencyFilter === 'all' || (entry.currency ?? 'unknown') === currencyFilter) &&
+      (!vendorSearch || (entry.vendorName ?? '').toLowerCase().includes(vendorSearch.trim().toLowerCase())) &&
+      (!dateFrom || Boolean(entry.invoiceDate && entry.invoiceDate >= dateFrom)) &&
+      (!dateTo || Boolean(entry.invoiceDate && entry.invoiceDate <= dateTo)) &&
+      (!overdueOnly || Boolean(entry.documentType === 'invoice' && entry.dueDate &&
+        entry.dueDate < today && entry.total !== null && Math.round(entry.total * 100) > Math.round(Number(entry.confirmedPaid) * 100))) &&
       [entry.filename, entry.invoiceNumber, entry.vendorName].some((value) => value?.toLowerCase().includes(query))
   })
 
@@ -372,9 +391,19 @@ function App() {
             <strong>{totalInvoices ?? '—'}</strong>
           </div>
 
-          {(['invoice', 'receipt'] as const).map((type) => (
+          {(['Billed', 'Confirmed paid', 'Outstanding'] as const).map((label) => (
+            <div className="stat-card" key={label}>
+              <h3>{label}</h3>
+              {balances.length ? balances.map(({ currency, billed, paid }) => (
+                <div className="currency-total" key={currency}>
+                  <strong>{formatPaymentAmount(label === 'Billed' ? Number(billed) : label === 'Confirmed paid' ? Number(paid) : Number(billed) - Number(paid), currency)}</strong>
+                </div>
+              )) : <strong>—</strong>}
+            </div>
+          ))}
+          {(['receipt'] as const).map((type) => (
             <div className="stat-card" key={type}>
-              <h3>{type === 'invoice' ? 'Total Invoiced' : 'Total Receipted'}</h3>
+              <h3>Receipt document totals</h3>
               {documentTotals.some((entry) => entry.documentType === type)
                 ? documentTotals.filter((entry) => entry.documentType === type).map((entry) => (
                     <div className="currency-total" key={entry.currency}>
@@ -522,6 +551,13 @@ function App() {
             </label>
           </div>
 
+          <div className="document-filters">
+            <label>Vendor<input type="search" value={vendorSearch} onChange={(event) => setVendorSearch(event.target.value)} /></label>
+            <label>From date<input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} /></label>
+            <label>To date<input type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} /></label>
+            <label><span>Overdue only</span><input type="checkbox" checked={overdueOnly} onChange={(event) => setOverdueOnly(event.target.checked)} /></label>
+          </div>
+
           {historyError && (
             <p role="alert" style={{ color: '#dc2626' }}>
               {historyError}
@@ -548,9 +584,13 @@ function App() {
                       'Vendor',
                       'Document Date',
                       'Amount',
+                      'Due Date',
+                      'Confirmed Paid',
+                      'Outstanding',
                       'Payment Status',
                       'Extraction',
                       'Document',
+                      'Payment',
                     ].map((heading) => (
                       <th
                         key={heading}
@@ -566,8 +606,14 @@ function App() {
                 </thead>
 
                 <tbody>
-                  {visibleDocuments.map((invoice) => (
-                    <tr key={invoice.id}>
+                  {visibleDocuments.map((invoice) => {
+                    const payable = invoice.documentType === 'invoice' && Boolean(invoice.currency) && invoice.total !== null
+                    const paid = Number(invoice.confirmedPaid ?? 0)
+                    const outstanding = payable ? Math.round(((invoice.total ?? 0) - paid) * 100) / 100 : null
+                    const reported = Number(invoice.reportedPaid ?? 0)
+                    const status = outstanding === null ? '—' : outstanding <= 0 ? 'Paid' :
+                      paid > 0 ? 'Partially paid' : reported > 0 || invoice.paymentStatus === 'paid' ? 'Payment unverified' : 'Open'
+                    return <tr key={invoice.id}>
                       <td style={{ padding: '12px' }}>
                         {invoice.id}
                       </td>
@@ -597,7 +643,14 @@ function App() {
                       </td>
 
                       <td style={{ padding: '12px' }}>
-                        {invoice.paymentStatus ?? 'Unknown'}
+                        {invoice.dueDate ?? '—'}
+                      </td>
+                      <td style={{ padding: '12px' }}>{payable ? formatPaymentAmount(paid, invoice.currency ?? '') : '—'}</td>
+                      <td style={{ padding: '12px' }}>{outstanding === null ? '—' : formatPaymentAmount(outstanding, invoice.currency ?? '')}</td>
+                      <td style={{ padding: '12px' }}>
+                        {status}
+                        {reported > 0 && <><br />Reported {formatPaymentAmount(reported, invoice.currency ?? '')}</>}
+                        {paid > 0 && <><br />{invoice.hasReceipt ? 'Receipt attached' : 'Receipt missing'}</>}
                       </td>
 
                       <td style={{ padding: '12px' }}>
@@ -625,8 +678,11 @@ function App() {
                         )}
                       </td>
 
+                      <td style={{ padding: '12px' }}>
+                        {outstanding !== null && outstanding > 0 && <button type="button" onClick={() => setPaymentInvoice({ ...invoice })}>Record payment</button>}
+                      </td>
                     </tr>
-                  ))}
+                  })}
                 </tbody>
               </table>
             </div>
@@ -634,6 +690,9 @@ function App() {
         </section>
 
 
+        <Payments documents={invoiceHistory} invoice={paymentInvoice}
+          onCloseInvoice={() => setPaymentInvoice(null)}
+          onSaved={() => Promise.all([loadStats(), loadInvoiceHistory()])} />
       </main>
     </div>
   )
