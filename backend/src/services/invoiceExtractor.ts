@@ -53,6 +53,7 @@ const invoiceSchema = {
   type: 'object',
   additionalProperties: false,
   properties: {
+    document_type: { type: 'string', enum: ['invoice', 'receipt', 'unknown'] },
     invoice_number: nullableString,
     invoice_date: nullableString,
     due_date: nullableString,
@@ -113,6 +114,7 @@ const invoiceSchema = {
   },
 
   required: [
+    'document_type',
     'invoice_number',
     'invoice_date',
     'due_date',
@@ -313,6 +315,16 @@ Follow these rules:
 18. Never replace missing values
     with zero unless the document
     explicitly states zero.
+
+19. Classify by purpose. An invoice requests or records a charge and may be
+    marked paid. A receipt is primarily evidence of payment. A generic title
+    like Bill alone does not establish the type. Use unknown if unclear.
+    For a receipt, use invoice_number for the receipt reference, invoice_date
+    for the payment or receipt date, and total for the documented amount paid.
+
+20. Preserve the original currency. Use INR for explicit Indian rupees or ₹,
+    USD for explicit USD or US$, and null for an ambiguous $ without enough
+    context. Do not convert amounts.
 `
 
   const base64 = buffer.toString('base64')

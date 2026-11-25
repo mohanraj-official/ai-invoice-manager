@@ -9,6 +9,7 @@ export async function saveInvoiceExtractionPg(
 ): Promise<void> {
   const columns = [
     'invoice_id',
+    'document_type',
     'invoice_number',
     'invoice_date',
     'due_date',
@@ -36,6 +37,7 @@ export async function saveInvoiceExtractionPg(
 
   const values = [
     invoiceId,
+    invoice.document_type ?? 'unknown',
     invoice.invoice_number,
     invoice.invoice_date,
     invoice.due_date,

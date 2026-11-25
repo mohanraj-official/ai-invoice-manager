@@ -26,6 +26,7 @@ type InvoiceHistoryItem = {
   mimeType: string
   fileSize: number
   uploadedAt: string
+  documentType: 'invoice' | 'receipt' | 'unknown' | null
   invoiceNumber: string | null
   invoiceDate: string | null
   vendorName: string | null
@@ -39,10 +40,12 @@ type InvoiceHistoryItem = {
 }
 
 
+type DocumentTotal = { documentType: 'invoice' | 'receipt'; currency: string; total: number }
+
 type DashboardStats = {
   success: boolean
   totalInvoices: number
-  totalExpenses: number
+  documentTotals: DocumentTotal[]
   duplicatesDetected: number
 }
 
@@ -74,8 +77,11 @@ function App() {
   const [totalInvoices, setTotalInvoices] =
     useState<number | null>(null)
 
-  const [totalExpenses, setTotalExpenses] =
-    useState<number | null>(null)
+  const [documentTotals, setDocumentTotals] = useState<DocumentTotal[]>([])
+  const [documentFilter, setDocumentFilter] = useState('all')
+  const [currencyFilter, setCurrencyFilter] = useState('all')
+  const [search, setSearch] = useState('')
+  const [dragging, setDragging] = useState(false)
 
   const [duplicatesDetected, setDuplicatesDetected] =
     useState<number | null>(null)
@@ -93,7 +99,7 @@ function App() {
     }
 
     setTotalInvoices(stats.totalInvoices)
-    setTotalExpenses(stats.totalExpenses)
+    setDocumentTotals(stats.documentTotals ?? [])
     setDuplicatesDetected(stats.duplicatesDetected)
   }
 
@@ -176,7 +182,12 @@ function App() {
   function handleFileSelection(
     event: React.ChangeEvent<HTMLInputElement>
   ) {
-    const selectedFiles = Array.from(event.target.files ?? [])
+    selectFiles(Array.from(event.target.files ?? []))
+    event.target.value = ''
+  }
+
+  function selectFiles(selectedFiles: File[]) {
+    if (uploading || selectedFiles.length === 0) return
 
     setMessage('')
 
@@ -195,6 +206,12 @@ function App() {
       setMessage(
         `${oversizedFile.name} exceeds the 10 MB file limit.`
       )
+      return
+    }
+
+    const invalidFile = selectedFiles.find((file) => !/\.(pdf|jpe?g|png)$/i.test(file.name))
+    if (invalidFile) {
+      setMessage(`${invalidFile.name} must be a PDF, JPG, or PNG.`)
       return
     }
 
@@ -326,6 +343,15 @@ function App() {
     }
   }
 
+  const query = search.trim().toLowerCase()
+  const currencies = [...new Set([...documentTotals.map((entry) => entry.currency), ...invoiceHistory.flatMap((entry) => entry.currency ? [entry.currency] : [])])].sort()
+  const visibleDocuments = invoiceHistory.filter((entry) => {
+    const needsReview = !entry.documentType || entry.documentType === 'unknown' || !entry.currency || entry.financialStatus === 'mismatch'
+    return (documentFilter === 'all' || (documentFilter === 'review' ? needsReview : entry.documentType === documentFilter)) &&
+      (currencyFilter === 'all' || (entry.currency ?? 'unknown') === currencyFilter) &&
+      [entry.filename, entry.invoiceNumber, entry.vendorName].some((value) => value?.toLowerCase().includes(query))
+  })
+
   return (
     <div className="app">
       <header className="header">
@@ -342,18 +368,23 @@ function App() {
       <main>
         <section className="stats">
           <div className="stat-card">
-            <h3>Total Invoices</h3>
+            <h3>Uploaded Documents</h3>
             <strong>{totalInvoices ?? '—'}</strong>
           </div>
 
-          <div className="stat-card">
-            <h3>Total Invoiced (INR)</h3>
-            <strong>
-              {totalExpenses === null
-                ? '—'
-                : currencyFormatter.format(totalExpenses)}
-            </strong>
-          </div>
+          {(['invoice', 'receipt'] as const).map((type) => (
+            <div className="stat-card" key={type}>
+              <h3>{type === 'invoice' ? 'Total Invoiced' : 'Total Receipted'}</h3>
+              {documentTotals.some((entry) => entry.documentType === type)
+                ? documentTotals.filter((entry) => entry.documentType === type).map((entry) => (
+                    <div className="currency-total" key={entry.currency}>
+                      <span>{entry.currency}</span>
+                      <strong>{entry.total.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
+                    </div>
+                  ))
+                : <strong>—</strong>}
+            </div>
+          ))}
 
           <div className="stat-card">
             <h3>Duplicates Detected</h3>
@@ -362,14 +393,36 @@ function App() {
         </section>
 
         <section className="upload-card">
-          <h2>Upload Invoices</h2>
+          <h2>Upload Invoices and Receipts</h2>
 
           <p>
             Select up to 10 PDF, JPG, or PNG files
             (maximum 10 MB each).
           </p>
 
+          <div
+            className={dragging ? 'drop-zone drop-zone-active' : 'drop-zone'}
+            onDragOver={(event) => {
+              event.preventDefault()
+              if (!uploading) setDragging(true)
+            }}
+            onDragLeave={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false)
+            }}
+            onDrop={(event) => {
+              event.preventDefault()
+              setDragging(false)
+              selectFiles(Array.from(event.dataTransfer.files))
+            }}
+          >
+            <p>Drag and drop files here</p>
+            <button type="button" disabled={uploading} onClick={() => fileInputRef.current?.click()}>
+              Browse files
+            </button>
+          </div>
+
           <input
+            hidden
             ref={fileInputRef}
             type="file"
             accept=".pdf,.jpg,.jpeg,.png"
@@ -378,7 +431,22 @@ function App() {
             onChange={handleFileSelection}
           />
 
+          {files.length > 0 && (
+            <ul className="selected-files">
+              {files.map((file, index) => (
+                <li key={`${file.name}-${index}`}>
+                  <span>{file.name}</span>
+                  <button type="button" disabled={uploading} aria-label={`Remove ${file.name}`}
+                    onClick={() => setFiles((current) => current.filter((_, position) => position !== index))}>
+                    Remove
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+
           <button
+            className="upload-action"
             type="button"
             disabled={files.length === 0 || uploading}
             onClick={() => void handleUpload()}
@@ -431,7 +499,28 @@ function App() {
 
 
         <section className="upload-card">
-          <h2>Invoice History</h2>
+          <h2>Document History</h2>
+          <div className="document-filters">
+            <label>Document type
+              <select value={documentFilter} onChange={(event) => setDocumentFilter(event.target.value)}>
+                <option value="all">All documents</option>
+                <option value="invoice">Invoices</option>
+                <option value="receipt">Receipts</option>
+                <option value="review">Needs review</option>
+              </select>
+            </label>
+            <label>Currency
+              <select value={currencyFilter} onChange={(event) => setCurrencyFilter(event.target.value)}>
+                <option value="all">All currencies</option>
+                {currencies.map((currency) => <option key={currency}>{currency}</option>)}
+                <option value="unknown">Unknown currency</option>
+              </select>
+            </label>
+            <label>Search recent documents
+              <input type="search" placeholder="Vendor, reference, or filename" value={search}
+                onChange={(event) => setSearch(event.target.value)} />
+            </label>
+          </div>
 
           {historyError && (
             <p role="alert" style={{ color: '#dc2626' }}>
@@ -439,8 +528,8 @@ function App() {
             </p>
           )}
 
-          {invoiceHistory.length === 0 ? (
-            <p>No invoices found.</p>
+          {visibleDocuments.length === 0 ? (
+            <p>No matching documents.</p>
           ) : (
             <div style={{ overflowX: 'auto' }}>
               <table
@@ -454,9 +543,10 @@ function App() {
                   <tr>
                     {[
                       'ID',
-                      'Invoice Number',
+                      'Type',
+                      'Reference',
                       'Vendor',
-                      'Invoice Date',
+                      'Document Date',
                       'Amount',
                       'Payment Status',
                       'Extraction',
@@ -476,10 +566,14 @@ function App() {
                 </thead>
 
                 <tbody>
-                  {invoiceHistory.map((invoice) => (
+                  {visibleDocuments.map((invoice) => (
                     <tr key={invoice.id}>
                       <td style={{ padding: '12px' }}>
                         {invoice.id}
+                      </td>
+
+                      <td style={{ padding: '12px' }}>
+                        {invoice.documentType === 'invoice' ? 'Invoice' : invoice.documentType === 'receipt' ? 'Receipt' : 'Needs review'}
                       </td>
 
                       <td style={{ padding: '12px' }}>
@@ -522,7 +616,7 @@ function App() {
                             target="_blank"
                             rel="noopener noreferrer"
                           >
-                            Open PDF
+                            Open file
                           </a>
                         ) : (
                           <span style={{ color: '#94a3b8' }}>

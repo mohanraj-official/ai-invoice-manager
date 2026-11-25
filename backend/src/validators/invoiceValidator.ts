@@ -20,6 +20,7 @@ const lineItemSchema = z.object({
 }).strict()
 
 export const extractedInvoiceSchema = z.object({
+  document_type: z.enum(['invoice', 'receipt', 'unknown']).default('unknown'),
   invoice_number: nullableString,
   invoice_date: nullableString,
   due_date: nullableString,

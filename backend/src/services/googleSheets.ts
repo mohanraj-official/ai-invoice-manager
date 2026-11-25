@@ -26,6 +26,7 @@ const HEADERS = [
   'Drive Link',
   'Billing Start',
   'Billing End',
+  'Document Type',
 ]
 
 export async function saveInvoiceToSheet(
@@ -47,15 +48,16 @@ export async function saveInvoiceToSheet(
   // Check the header row.
   const headerResponse = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: `${SHEET_NAME}!A1:R1`,
+    range: `${SHEET_NAME}!A1:S1`,
   })
 
   const existingHeaders = headerResponse.data.values?.[0]
 
-  if (!existingHeaders?.length) {
+  const hasLegacyHeaders = JSON.stringify(existingHeaders) === JSON.stringify(HEADERS.slice(0, -1))
+  if (!existingHeaders?.length || hasLegacyHeaders) {
     await sheets.spreadsheets.values.update({
       spreadsheetId,
-      range: `${SHEET_NAME}!A1:R1`,
+      range: `${SHEET_NAME}!A1:S1`,
       valueInputOption: 'RAW',
       requestBody: {
         values: [HEADERS],
@@ -86,6 +88,7 @@ export async function saveInvoiceToSheet(
     driveLink,
     invoice.billing_period_start,
     invoice.billing_period_end,
+    invoice.document_type ?? 'unknown',
   ]
 
   // Look up existing invoice IDs to avoid duplicate rows.
@@ -105,7 +108,7 @@ export async function saveInvoiceToSheet(
 
     await sheets.spreadsheets.values.update({
       spreadsheetId,
-      range: `${SHEET_NAME}!A${rowNumber}:R${rowNumber}`,
+      range: `${SHEET_NAME}!A${rowNumber}:S${rowNumber}`,
       valueInputOption: 'RAW',
       requestBody: {
         values: [row],
@@ -114,7 +117,7 @@ export async function saveInvoiceToSheet(
   } else {
     await sheets.spreadsheets.values.append({
       spreadsheetId,
-      range: `${SHEET_NAME}!A:R`,
+      range: `${SHEET_NAME}!A:S`,
       valueInputOption: 'RAW',
       insertDataOption: 'INSERT_ROWS',
       requestBody: {

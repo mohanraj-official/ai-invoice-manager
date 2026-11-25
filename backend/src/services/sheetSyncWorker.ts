@@ -12,6 +12,7 @@ type PendingInvoice = {
   drive_file_id: string
   drive_file_url: string
   financial_check_status: string
+  document_type: ExtractedInvoice['document_type']
   invoice_number: string | null
   invoice_date: string | null
   due_date: string | null
@@ -41,6 +42,7 @@ function amount(value: number | string | null): number | null {
 
 function rebuildInvoice(row: PendingInvoice): ExtractedInvoice {
   return {
+    document_type: row.document_type ?? 'unknown',
     invoice_number: row.invoice_number,
     invoice_date: row.invoice_date,
     due_date: row.due_date,
@@ -88,6 +90,7 @@ async function retrySheetSync(): Promise<void> {
         i.drive_file_id,
         i.drive_file_url,
         e.financial_check_status,
+        e.document_type,
         e.invoice_number,
         e.invoice_date,
         e.due_date,

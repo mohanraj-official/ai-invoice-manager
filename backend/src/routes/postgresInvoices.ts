@@ -6,7 +6,7 @@ const router = Router()
 // Dashboard statistics
 router.get('/stats', async (_req, res) => {
   try {
-    const [invoices, duplicates, expenses] = await Promise.all([
+    const [invoices, duplicates, expenses, documentTotals] = await Promise.all([
       pool.query('SELECT COUNT(*) AS total FROM invoices'),
 
       pool.query(`
@@ -21,6 +21,14 @@ router.get('/stats', async (_req, res) => {
         WHERE currency = 'INR'
           AND total IS NOT NULL
       `),
+      pool.query(`
+        SELECT document_type, currency, SUM(total) AS total
+        FROM invoice_extractions
+        WHERE document_type IN ('invoice', 'receipt')
+          AND currency ~ '^[A-Z]{3}$' AND total IS NOT NULL
+        GROUP BY document_type, currency
+        ORDER BY currency
+      `),
     ])
 
     res.json({
@@ -28,6 +36,11 @@ router.get('/stats', async (_req, res) => {
       totalInvoices: Number(invoices.rows[0].total),
       duplicatesDetected: Number(duplicates.rows[0].total),
       totalExpenses: Number(expenses.rows[0].total),
+      documentTotals: documentTotals.rows.map((row) => ({
+        documentType: row.document_type,
+        currency: row.currency,
+        total: Number(row.total),
+      })),
     })
   } catch (error) {
     console.error('PostgreSQL statistics error:', error)
@@ -52,6 +65,7 @@ router.get('/invoices', async (_req, res) => {
         i.drive_file_url AS "driveFileUrl",
         i.drive_status AS "driveStatus",
 
+        e.document_type AS "documentType",
         e.invoice_number AS "invoiceNumber",
         e.invoice_date AS "invoiceDate",
         e.vendor_name AS "vendorName",
@@ -114,6 +128,7 @@ router.get('/invoices/:id', async (req, res) => {
           i.filename,
           i.drive_file_url AS "driveFileUrl",
 
+          e.document_type AS "documentType",
           e.invoice_number AS "invoiceNumber",
           e.invoice_date AS "invoiceDate",
           e.due_date AS "dueDate",

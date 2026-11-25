@@ -82,3 +82,18 @@
     grid-template-columns: 1fr;
   }
 }
+
+.stats { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.currency-total { display: flex; align-items: baseline; gap: 8px; }
+.currency-total strong { font-size: 22px; }
+.drop-zone { border: 2px dashed #94a3b8; border-radius: 12px; padding: 24px; text-align: center; background: #f8fafc; }
+.drop-zone-active { border-color: #2563eb; background: #eff6ff; }
+.drop-zone p { margin: 0 0 12px; }
+.drop-zone button, .upload-action { background: #2563eb; color: white; border: 0; padding: 9px 16px; border-radius: 8px; cursor: pointer; }
+.upload-action { margin-top: 16px; }
+.upload-card button:disabled { opacity: 0.55; cursor: default; }
+.selected-files { list-style: none; padding: 0; }
+.selected-files li { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; overflow-wrap: anywhere; }
+.document-filters { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+.document-filters label { display: grid; gap: 4px; font-size: 14px; }
+.document-filters input, .document-filters select { border: 1px solid #94a3b8; border-radius: 6px; padding: 8px; font: inherit; }

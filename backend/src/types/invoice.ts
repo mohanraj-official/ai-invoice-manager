@@ -14,7 +14,10 @@ export type InvoiceParty = {
   address: string | null
 }
 
+export type DocumentType = 'invoice' | 'receipt' | 'unknown'
+
 export type ExtractedInvoice = {
+  document_type?: DocumentType
   invoice_number: string | null
   invoice_date: string | null
   due_date: string | null
