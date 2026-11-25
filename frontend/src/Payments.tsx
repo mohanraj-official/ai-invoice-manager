@@ -1,9 +1,10 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 
 export type PaymentDocument = {
   id: number
   documentType: 'invoice' | 'receipt' | 'unknown' | null
   invoiceNumber: string | null
+  invoiceDate: string | null
   vendorName: string | null
   filename: string
   currency: string | null
@@ -23,6 +24,17 @@ type Payment = {
   verifiedAt: string | null
   allocations: { invoiceId: number; amount: number }[]
   receipts: { receiptId: number; url: string | null }[]
+}
+
+type PaymentDraft = {
+  paymentDate: string
+  method: string
+  amount: string
+  currency: string
+  reference?: string
+  receiptId?: number
+  confirmed: boolean
+  allocations: { invoiceId: number; amount: string }[]
 }
 
 type Props = {
@@ -56,6 +68,10 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
   const [loadError, setLoadError] = useState('')
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
+  const writing = useRef(false)
+  const [preview, setPreview] = useState<PaymentDraft | null>(null)
+  const [split, setSplit] = useState(false)
+  const [paymentAmount, setPaymentAmount] = useState('')
   const [draft, setDraft] = useState(false)
   const [editAllocation, setEditAllocation] = useState<string | null>(null)
   const [editEvidence, setEditEvidence] = useState<string | null>(null)
@@ -81,7 +97,10 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
     if (!invoice?.currency) return
     const remaining = Math.max(0, (invoice.total ?? 0) - Number(invoice.confirmedPaid ?? 0))
     setCurrency(invoice.currency)
-    setAllocations({ [invoice.id]: remaining.toFixed(2) })
+    setPaymentAmount(remaining.toFixed(2))
+    setAllocations({})
+    setSplit(false)
+    setPreview(null)
     setConfirmed(false)
     setMessage('')
     setDraft(true)
@@ -90,12 +109,17 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
 
   function resetDraft() {
     setDraft(false)
+    setPreview(null)
+    setSplit(false)
+    setPaymentAmount('')
     setAllocations({})
     setConfirmed(false)
     onCloseInvoice()
   }
 
   async function save(path: string, payload: unknown, close: () => void) {
+    if (writing.current) return
+    writing.current = true
     setBusy(true)
     setMessage('')
     try {
@@ -112,6 +136,7 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Payment could not be saved.')
     } finally {
+      writing.current = false
       setBusy(false)
     }
   }
@@ -121,7 +146,7 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
     return documents.filter((document) =>
       document.documentType === 'receipt' && document.currency === forCurrency && !usedReceipts.has(document.id),
     ).map((document) => <option key={document.id} value={document.id}>
-      {documentLabel(document)}{document.total !== null ? ` · ${formatPaymentAmount(document.total, forCurrency)}` : ''}
+      {documentLabel(document)}{document.invoiceDate ? ' · ' + document.invoiceDate : ''}{document.total !== null ? ` · ${formatPaymentAmount(document.total, forCurrency)}` : ''}
     </option>)
   }
 
@@ -130,17 +155,29 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
     const fields = new FormData(event.currentTarget)
     const reference = String(fields.get('reference') ?? '').trim()
     const receiptId = Number(fields.get('receiptId'))
-    void save('', {
-      paymentDate: fields.get('paymentDate'),
-      method: fields.get('method'),
-      amount: fields.get('amount'),
+    const amount = String(fields.get('amount'))
+    const distribution = invoice && !split ? [{ invoiceId: invoice.id, amount }] :
+      Object.entries(allocations).filter(([, applied]) => applied.trim() !== '')
+        .map(([invoiceId, applied]) => ({ invoiceId: Number(invoiceId), amount: applied }))
+    if (confirmed && !reference && !receiptId) {
+      setMessage('Add a transaction reference or choose a receipt to confirm payment.')
+      return
+    }
+    if (distribution.reduce((sum, entry) => sum + Math.round(Number(entry.amount) * 100), 0) > Math.round(Number(amount) * 100)) {
+      setMessage('The amounts applied to invoices exceed the payment amount.')
+      return
+    }
+    setMessage('')
+    setPreview({
+      paymentDate: String(fields.get('paymentDate')),
+      method: String(fields.get('method')),
+      amount,
       currency,
-      reference: reference || undefined,
-      receiptId: receiptId || undefined,
+      ...(reference && { reference }),
+      ...(receiptId && { receiptId }),
       confirmed,
-      allocations: Object.entries(allocations).filter(([, amount]) => amount.trim() !== '')
-        .map(([invoiceId, amount]) => ({ invoiceId: Number(invoiceId), amount })),
-    }, resetDraft)
+      allocations: distribution,
+    })
   }
 
   const openInvoices = (forCurrency: string) => documents.filter((document) =>
@@ -167,17 +204,20 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
       {message && <p role="status">{message}</p>}
 
       {draft && (
-        <form className="payment-form" onSubmit={submitPayment} key={invoice?.id ?? 'new'}>
-          <h3>{invoice ? `Record payment for invoice #${invoice.id}` : 'Record payment'}</h3>
+        <form className="payment-form" onSubmit={submitPayment} key={invoice?.id ?? 'new'} hidden={Boolean(preview)}>
+          <h3>{invoice ? `Record payment · ${invoice.vendorName ?? invoice.filename}` : 'Record payment'}</h3>
+          {invoice && <p>{documentLabel(invoice)} · {invoice.currency}</p>}
           <div className="document-filters">
             <label>Payment date<input type="date" name="paymentDate" required /></label>
-            <label>Currency<select value={currency} onChange={(event) => {
+            <label>Currency<select value={currency} disabled={Boolean(invoice)} onChange={(event) => {
               setCurrency(event.target.value)
               setAllocations({})
             }}>
               {currencyChoices.map((choice) => <option key={choice}>{choice}</option>)}
             </select></label>
-            <label>Payment amount<input name="amount" type="number" min="0.01" step="0.01" required /></label>
+            <label>Payment amount<input name="amount" type="number" min="0.01" step="0.01" required value={paymentAmount}
+              max={invoice && !split ? Math.max(0, (invoice.total ?? 0) - Number(invoice.confirmedPaid ?? 0)).toFixed(2) : undefined}
+              onChange={(event) => setPaymentAmount(event.target.value)} /></label>
             <label>Method<select name="method">
               <option value="bank">Bank transfer</option><option value="card">Card</option>
               <option value="upi">UPI</option><option value="cash">Cash</option><option value="other">Other</option>
@@ -187,8 +227,14 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
               <option value="">No receipt attached</option>{receiptOptions(currency)}
             </select></label>
           </div>
-          <fieldset>
-            <legend>Apply to invoices</legend>
+          <details className="payment-options" open={split} onToggle={(event) => {
+            const open = event.currentTarget.open
+            if (open && !split && invoice) setAllocations({ [invoice.id]: paymentAmount })
+            setSplit(open)
+          }}>
+            <summary>{invoice ? 'Split across invoices' : 'Apply to invoices'}</summary>
+          <fieldset hidden={!split}>
+            <legend>Amounts to apply</legend>
             {availableInvoices.length === 0 && <p>No recent open invoices in {currency}.</p>}
             {availableInvoices.map((entry) => (
               <label className="payment-allocation" key={entry.id}>
@@ -199,14 +245,36 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
               </label>
             ))}
           </fieldset>
+          </details>
           <label><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> I verified this payment against the transaction or receipt</label>
           <p>Leave unverified payments unchecked. They stay in review until you confirm the evidence.</p>
           <div className="payment-toolbar">
-            <button type="submit" disabled={busy}>Save payment</button>
+            <button type="submit" className="primary-button" disabled={busy}>Review payment</button>
             <button type="button" disabled={busy} onClick={resetDraft}>Cancel</button>
           </div>
         </form>
       )}
+
+      {preview && <section className="payment-form" aria-label="Review payment">
+        <h3>Review payment</h3>
+        <p><strong>{formatPaymentAmount(Number(preview.amount), preview.currency)}</strong> · {preview.paymentDate} · {preview.method.toUpperCase()}</p>
+        {preview.reference && <p>Reference {preview.reference}</p>}
+        {preview.receiptId && (() => {
+          const receipt = documents.find((document) => document.id === preview.receiptId)
+          return <p>Receipt {receipt ? documentLabel(receipt) : '#' + preview.receiptId}
+            {receipt?.invoiceDate ? ' · ' + receipt.invoiceDate : ''}
+            {receipt?.total != null ? ' · ' + formatPaymentAmount(receipt.total, preview.currency) : ''}</p>
+        })()}
+        <p>{preview.confirmed ? 'Save as confirmed' : 'Save for verification'}</p>
+        {preview.allocations.length ? <ul>{preview.allocations.map((entry) => {
+          const invoice = documents.find((document) => document.id === entry.invoiceId)
+          return <li key={entry.invoiceId}>{invoice ? documentLabel(invoice) : `Invoice #${entry.invoiceId}`} · {formatPaymentAmount(Number(entry.amount), preview.currency)}</li>
+        })}</ul> : <p>This payment will remain unallocated.</p>}
+        <div className="payment-toolbar">
+          <button type="button" className="primary-button" disabled={busy} onClick={() => void save('', preview, resetDraft)}>Confirm and save</button>
+          <button type="button" disabled={busy} onClick={() => setPreview(null)}>Back to edit</button>
+        </div>
+      </section>}
 
       {!visiblePayments.length && !loadError && <p>No matching payments.</p>}
       {visiblePayments.map((entry) => {
