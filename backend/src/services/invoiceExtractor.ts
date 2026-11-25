@@ -1,38 +1,42 @@
 import { validateExtractedInvoice } from '../validators/invoiceValidator.js'
 import 'dotenv/config'
-import { GoogleGenAI, Type } from '@google/genai'
+import { GoogleGenAI } from '@google/genai'
 import type { ExtractedInvoice } from '../types/invoice.js'
 
 // --------------------------------------------------
-// 1. Gemini API configuration
+// 1. Invoice extraction provider
 // --------------------------------------------------
 
-const apiKey = process.env.GEMINI_API_KEY
+const openRouterKey = process.env.OPENROUTER_API_KEY?.trim()
+const googleKey = process.env.GEMINI_API_KEY
+const openRouterModel =
+  process.env.OPENROUTER_MODEL?.trim() || 'google/gemini-3.8-flash'
 
-if (!apiKey) {
-  throw new Error('GEMINI_API_KEY is missing')
+if (!openRouterKey && !googleKey) {
+  throw new Error('Set OPENROUTER_API_KEY or GEMINI_API_KEY')
 }
 
-const ai = new GoogleGenAI({ apiKey })
+const google = !openRouterKey && googleKey
+  ? new GoogleGenAI({ apiKey: googleKey })
+  : undefined
+const providerName = openRouterKey ? 'OpenRouter' : 'Gemini'
 
-const MODEL = 'gemini-3.5-flash'
 
 // --------------------------------------------------
 // 2. Reusable schema definitions
 // --------------------------------------------------
 
 const nullableString = {
-  type: Type.STRING,
-  nullable: true,
+  type: ['string', 'null'],
 }
 
 const nullableNumber = {
-  type: Type.NUMBER,
-  nullable: true,
+  type: ['number', 'null'],
 }
 
 const partySchema = {
-  type: Type.OBJECT,
+  type: 'object',
+  additionalProperties: false,
   properties: {
     name: nullableString,
     tax_id: nullableString,
@@ -46,7 +50,8 @@ const partySchema = {
 // --------------------------------------------------
 
 const invoiceSchema = {
-  type: Type.OBJECT,
+  type: 'object',
+  additionalProperties: false,
   properties: {
     invoice_number: nullableString,
     invoice_date: nullableString,
@@ -68,7 +73,7 @@ const invoiceSchema = {
     total: nullableNumber,
 
     payment_status: {
-      type: Type.STRING,
+      type: 'string',
       enum: [
         'paid',
         'unpaid',
@@ -83,9 +88,10 @@ const invoiceSchema = {
     billing_period_end: nullableString,
 
     line_items: {
-      type: Type.ARRAY,
+      type: 'array',
       items: {
-        type: Type.OBJECT,
+        type: 'object',
+        additionalProperties: false,
         properties: {
           description: nullableString,
           quantity: nullableNumber,
@@ -195,7 +201,7 @@ async function withRetry<T>(
         Math.floor(Math.random() * 500)
 
       console.warn(
-        `Gemini request failed (${status}). ` +
+        `${providerName} request failed (${status}). ` +
         `Retry ${attempt}/${maxAttempts - 1} ` +
         `in ${Math.ceil(delay / 1000)} seconds.`
       )
@@ -204,7 +210,7 @@ async function withRetry<T>(
     }
   }
 
-  throw new Error('Gemini retry attempts exhausted')
+  throw new Error(`${providerName} retry attempts exhausted`)
 }
 
 // --------------------------------------------------
@@ -233,19 +239,7 @@ export async function extractInvoice(
     throw new Error('Invoice file exceeds 10 MB')
   }
 
-  const response = await withRetry(() =>
-    ai.models.generateContent({
-      model: MODEL,
-
-      contents: [
-        {
-          inlineData: {
-            mimeType,
-            data: buffer.toString('base64'),
-          },
-        },
-        {
-          text: `
+  const prompt = `
 You are an invoice data extraction system.
 
 Extract structured information from the
@@ -319,28 +313,78 @@ Follow these rules:
 18. Never replace missing values
     with zero unless the document
     explicitly states zero.
-`,
+`
+
+  const base64 = buffer.toString('base64')
+  const text = await withRetry(async () => {
+    if (google) {
+      const response = await google.models.generateContent({
+        model: 'gemini-3.5-flash',
+        contents: [{ inlineData: { mimeType, data: base64 } }, { text: prompt }],
+        config: {
+          responseMimeType: 'application/json',
+          responseJsonSchema: invoiceSchema,
+          temperature: 0,
         },
-      ],
+      })
+      return response.text
+    }
 
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: invoiceSchema,
-        temperature: 0,
+    const dataUrl = `data:${mimeType};base64,${base64}`
+    const attachment = mimeType === 'application/pdf'
+      ? { type: 'file', file: { filename: 'invoice.pdf', file_data: dataUrl } }
+      : { type: 'image_url', image_url: { url: dataUrl } }
+
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${openRouterKey}`,
+        'Content-Type': 'application/json',
       },
+      signal: AbortSignal.timeout(120_000),
+      body: JSON.stringify({
+        model: openRouterModel,
+        max_tokens: 8192,
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, attachment] }],
+        provider: { require_parameters: true },
+        response_format: {
+          type: 'json_schema',
+          json_schema: { name: 'invoice', strict: true, schema: invoiceSchema },
+        },
+        temperature: 0,
+      }),
     })
-  )
 
-  if (!response.text?.trim()) {
-    throw new Error('Gemini returned an empty response')
+    if (!response.ok) {
+      await response.body?.cancel()
+      throw Object.assign(new Error(`OpenRouter request failed (HTTP ${response.status})`), {
+        status: response.status,
+      })
+    }
+
+    const result = await response.json() as {
+      error?: { code?: number }
+      choices?: { message?: { content?: string | null } }[]
+    }
+    if (result.error) {
+      throw Object.assign(new Error('OpenRouter returned a generation error'), {
+        status: result.error.code,
+      })
+    }
+    return result.choices?.[0]?.message?.content
+  })
+
+  if (!text?.trim()) {
+    throw new Error(`${providerName} returned an empty response`)
   }
+
 
   let parsed: unknown
 
   try {
-    parsed = JSON.parse(response.text)
+    parsed = JSON.parse(text)
   } catch {
-    throw new Error('Gemini returned invalid JSON')
+    throw new Error(`${providerName} returned invalid JSON`)
   }
 
   if (
@@ -348,9 +392,8 @@ Follow these rules:
     parsed === null ||
     Array.isArray(parsed)
   ) {
-    throw new Error('Gemini returned an invalid invoice object')
+    throw new Error(`${providerName} returned an invalid invoice object`)
   }
 
-  // Runtime field validation will be added next.
   return validateExtractedInvoice(parsed)
 }
