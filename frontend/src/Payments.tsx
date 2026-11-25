@@ -73,6 +73,10 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
   const [split, setSplit] = useState(false)
   const [paymentAmount, setPaymentAmount] = useState('')
   const [draft, setDraft] = useState(false)
+  const [manual, setManual] = useState(true)
+  const [receiptPreview, setReceiptPreview] = useState<PaymentDocument | null>(null)
+  const [readingReceipt, setReadingReceipt] = useState(false)
+  const receiptRequest = useRef<AbortController | null>(null)
   const [editAllocation, setEditAllocation] = useState<string | null>(null)
   const [editEvidence, setEditEvidence] = useState<string | null>(null)
   const [currency, setCurrency] = useState('INR')
@@ -96,20 +100,28 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
   useEffect(() => {
     if (!invoice?.currency) return
     const remaining = Math.max(0, (invoice.total ?? 0) - Number(invoice.confirmedPaid ?? 0))
+    receiptRequest.current?.abort()
+    setReadingReceipt(false)
+    setManual(false)
     setCurrency(invoice.currency)
     setPaymentAmount(remaining.toFixed(2))
     setAllocations({})
     setSplit(false)
     setPreview(null)
+    setReceiptPreview(null)
     setConfirmed(false)
     setMessage('')
     setDraft(true)
     document.getElementById('payments')?.scrollIntoView({ block: 'start' })
+    return () => receiptRequest.current?.abort()
   }, [invoice])
 
   function resetDraft() {
+    receiptRequest.current?.abort()
+    setReadingReceipt(false)
     setDraft(false)
     setPreview(null)
+    setReceiptPreview(null)
     setSplit(false)
     setPaymentAmount('')
     setAllocations({})
@@ -148,6 +160,72 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
     ).map((document) => <option key={document.id} value={document.id}>
       {documentLabel(document)}{document.invoiceDate ? ' · ' + document.invoiceDate : ''}{document.total !== null ? ` · ${formatPaymentAmount(document.total, forCurrency)}` : ''}
     </option>)
+  }
+
+  async function readReceipt(file: File, target: PaymentDocument) {
+    if (receiptRequest.current || writing.current) return
+    if (!/\.(pdf|jpe?g|png)$/i.test(file.name) || file.size === 0 || file.size > 10 * 1024 * 1024) {
+      setMessage('Choose a PDF, JPG, or PNG up to 10 MB.')
+      return
+    }
+    const controller = new AbortController()
+    receiptRequest.current = controller
+    setReadingReceipt(true)
+    setMessage('')
+    try {
+      const form = new FormData()
+      form.append('files', file)
+      const response = await fetch('/api/upload', { method: 'POST', body: form, signal: controller.signal })
+      const result = await response.json()
+      const uploaded = result.files?.[0]
+      if (!response.ok || !result.success || !uploaded) {
+        throw new Error(result.error ?? 'The attachment could not be uploaded.')
+      }
+      if (uploaded.extractionStatus !== 'completed') {
+        throw new Error('The attachment could not be read. Try uploading it again or enter the payment manually.')
+      }
+      const details = await fetch(`/api/invoices/${uploaded.invoiceId}`, { signal: controller.signal })
+      const body = await details.json()
+      if (!details.ok || !body.invoice) throw new Error('The extracted receipt could not be loaded.')
+      const receipt: PaymentDocument = body.invoice
+      if (receipt.documentType !== 'receipt') {
+        throw new Error('This file was saved under Documents, but the app could not identify it as a receipt. No payment was recorded.')
+      }
+      if (!receipt.currency || receipt.currency !== target.currency) {
+        throw new Error('The receipt currency is missing or differs from this invoice. No payment was recorded.')
+      }
+      if (payments.some((entry) => entry.receipts.some((linked) => linked.receiptId === receipt.id))) {
+        throw new Error('This receipt is already attached to a payment.')
+      }
+      const remaining = Math.round(((target.total ?? 0) - Number(target.confirmedPaid ?? 0)) * 100)
+      if (!receipt.invoiceDate || !/^\d{4}-\d{2}-\d{2}$/.test(receipt.invoiceDate) ||
+          receipt.total === null || !Number.isFinite(receipt.total) || receipt.total <= 0) {
+        throw new Error('The receipt is missing a usable payment date or amount. Enter the payment manually and select the uploaded receipt.')
+      }
+      if (Math.round(receipt.total * 100) > remaining) {
+        throw new Error('The receipt exceeds this invoice’s balance. Use manual entry to split the payment across invoices.')
+      }
+      if (controller.signal.aborted) return
+      setReceiptPreview(receipt)
+      const amount = receipt.total.toFixed(2)
+      setPreview({
+        paymentDate: receipt.invoiceDate,
+        amount,
+        currency: receipt.currency,
+        method: 'other',
+        receiptId: receipt.id,
+        confirmed: true,
+        allocations: [{ invoiceId: target.id, amount }],
+      })
+    } catch (error) {
+      if (!controller.signal.aborted) setMessage(error instanceof Error ? error.message : 'Could not read the receipt.')
+    } finally {
+      if (receiptRequest.current === controller) {
+        receiptRequest.current = null
+        setReadingReceipt(false)
+      }
+      if (!controller.signal.aborted) void onSaved().catch(() => {})
+    }
   }
 
   function submitPayment(event: FormEvent<HTMLFormElement>) {
@@ -196,6 +274,7 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
       <div className="payment-toolbar">
         <button type="button" className="upload-action" disabled={busy || draft} onClick={() => {
           setMessage('')
+          setManual(true)
           setDraft(true)
         }}>Record payment</button>
         <label><input type="checkbox" checked={reviewOnly} onChange={(event) => setReviewOnly(event.target.checked)} /> Needs review only</label>
@@ -203,7 +282,28 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
       {loadError && <p role="alert">{loadError}</p>}
       {message && <p role="status">{message}</p>}
 
-      {draft && (
+      {draft && invoice && !manual && !preview && (
+        <section className="payment-form" aria-label="Upload receipt">
+          <h3>Upload receipt</h3>
+          <p>Apply to {documentLabel(invoice)}</p>
+          <label className="receipt-picker">Receipt file
+            <input type="file" accept=".pdf,.jpg,.jpeg,.png" disabled={readingReceipt}
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0]
+                event.currentTarget.value = ''
+                if (file) void readReceipt(file, invoice)
+              }} />
+          </label>
+          {readingReceipt && <p role="status">Reading receipt…</p>}
+          <div className="payment-toolbar">
+            <button type="button" className="secondary-button" disabled={readingReceipt}
+              onClick={() => { setMessage(''); setManual(true) }}>Enter manually or use an existing receipt</button>
+            <button type="button" onClick={resetDraft}>Cancel</button>
+          </div>
+        </section>
+      )}
+
+      {draft && manual && (
         <form className="payment-form" onSubmit={submitPayment} key={invoice?.id ?? 'new'} hidden={Boolean(preview)}>
           <h3>{invoice ? `Record payment · ${invoice.vendorName ?? invoice.filename}` : 'Record payment'}</h3>
           {invoice && <p>{documentLabel(invoice)} · {invoice.currency}</p>}
@@ -257,14 +357,18 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
 
       {preview && <section className="payment-form" aria-label="Review payment">
         <h3>Review payment</h3>
-        <p><strong>{formatPaymentAmount(Number(preview.amount), preview.currency)}</strong> · {preview.paymentDate} · {preview.method.toUpperCase()}</p>
+        <p><strong>{formatPaymentAmount(Number(preview.amount), preview.currency)}</strong> · {preview.paymentDate}{!receiptPreview && ` · ${preview.method.toUpperCase()}`}</p>
         {preview.reference && <p>Reference {preview.reference}</p>}
         {preview.receiptId && (() => {
-          const receipt = documents.find((document) => document.id === preview.receiptId)
+          const receipt = receiptPreview ?? documents.find((document) => document.id === preview.receiptId)
           return <p>Receipt {receipt ? documentLabel(receipt) : '#' + preview.receiptId}
             {receipt?.invoiceDate ? ' · ' + receipt.invoiceDate : ''}
             {receipt?.total != null ? ' · ' + formatPaymentAmount(receipt.total, preview.currency) : ''}</p>
         })()}
+        {receiptPreview && <p>Check that this receipt belongs to the invoice below before confirming.
+          {invoice?.vendorName && receiptPreview.vendorName &&
+            invoice.vendorName.trim().toLowerCase() !== receiptPreview.vendorName.trim().toLowerCase() &&
+            ' The vendor names differ.'}</p>}
         <p>{preview.confirmed ? 'Save as confirmed' : 'Save for verification'}</p>
         {preview.allocations.length ? <ul>{preview.allocations.map((entry) => {
           const invoice = documents.find((document) => document.id === entry.invoiceId)
@@ -272,7 +376,10 @@ export default function Payments({ documents, invoice, onCloseInvoice, onSaved }
         })}</ul> : <p>This payment will remain unallocated.</p>}
         <div className="payment-toolbar">
           <button type="button" className="primary-button" disabled={busy} onClick={() => void save('', preview, resetDraft)}>Confirm and save</button>
-          <button type="button" disabled={busy} onClick={() => setPreview(null)}>Back to edit</button>
+          <button type="button" disabled={busy} onClick={() => {
+            setPreview(null)
+            setReceiptPreview(null)
+          }}>{receiptPreview ? 'Choose another receipt' : 'Back to edit'}</button>
         </div>
       </section>}
 

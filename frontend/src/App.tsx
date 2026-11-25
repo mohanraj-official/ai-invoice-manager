@@ -484,7 +484,7 @@ function App() {
                   <span>{outstanding !== null ? 'Outstanding' : 'Document amount'}</span></div>
                 <span className={status === 'Paid' ? 'document-status paid-status' : 'document-status'}>{status}</span>
                 {outstanding !== null && outstanding > 0 && <button type="button" className="secondary-button"
-                  onClick={() => openPayment(entry)}>Record payment</button>}
+                  onClick={() => openPayment(entry)}>Upload receipt</button>}
               </div>
               <details className="document-details">
                 <summary>Details</summary>

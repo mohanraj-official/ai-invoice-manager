@@ -63,3 +63,6 @@ summary { cursor: pointer; color: #17418d; font-size: .875rem; width: fit-conten
   .document-row button { justify-self: start; }
   .stat-card h3 { font-size: .76rem; }
 }
+
+.receipt-picker { display: grid; gap: 8px; width: fit-content; max-width: 100%; }
+.receipt-picker input { font: inherit; max-width: 100%; }
