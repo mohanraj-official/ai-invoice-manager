@@ -54,6 +54,32 @@ type Dashboard = {
   canConnectGoogle: boolean
 }
 
+type Expense = {
+  id: string
+  expenseId: string
+  description: string
+  vendor: string | null
+  paymentDate: string
+  amount: string
+  currency: string
+  status: string
+  hasReceipt: boolean
+  receiptUrl: string | null
+  linkedInvoice: string | null
+  syncPending: boolean
+}
+
+type ExpenseDraft = {
+  description: string
+  vendor: string
+  paymentDate: string
+  currency: string
+  amount: string
+  method?: string
+  transactionReference?: string
+  receiptNumber?: string
+}
+
 type UploadResult = {
   kind: 'invoice' | 'receipt' | 'duplicate' | 'review'
   invoiceId: string | null
@@ -183,8 +209,227 @@ function InvoiceDetails({ invoice, onReceipt }: { invoice: Invoice; onReceipt: (
   )
 }
 
+function ExpenseForm({ expense, initialFile, onClose, onSave }: {
+  expense?: Expense
+  initialFile?: File
+  onClose: () => void
+  onSave: (expense: Expense) => void
+}) {
+  const [mode, setMode] = useState<'receipt' | 'manual'>(expense || initialFile ? 'receipt' : 'manual')
+  const [file, setFile] = useState(initialFile)
+  const [receiptRead, setReceiptRead] = useState(false)
+  const [requestId] = useState(() => crypto.randomUUID())
+  const [draft, setDraft] = useState<ExpenseDraft>(() => ({
+    description: expense?.description ?? '',
+    vendor: expense?.vendor ?? '',
+    amount: expense?.amount ?? '',
+    currency: expense?.currency ?? 'INR',
+    paymentDate: expense?.paymentDate ?? new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date()),
+  }))
+  const [busy, setBusy] = useState<'read' | 'save'>()
+  const [error, setError] = useState('')
+  const reading = mode === 'receipt' && !receiptRead
+
+  async function readReceipt() {
+    if (!file) return
+    setBusy('read')
+    setError('')
+    try {
+      if (file.size > 10 * 1024 * 1024) throw new Error('Choose a file up to 10 MB.')
+      const form = new FormData()
+      form.set('files', file)
+      const proof = await api<ExpenseDraft>('/api/expenses/read-receipt', { method: 'POST', body: form })
+      setDraft({
+        ...proof,
+        description: expense?.description ?? proof.description,
+        vendor: proof.vendor || expense?.vendor || '',
+      })
+      setReceiptRead(true)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not read this receipt.')
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  async function save() {
+    setBusy('save')
+    setError('')
+    try {
+      const form = new FormData()
+      if (mode === 'receipt' && file) form.set('files', file)
+      form.set('details', JSON.stringify(expense ? draft : { requestId, details: draft }))
+      const path = expense ? '/api/expenses/' + expense.id + '/receipt' : '/api/expenses'
+      onSave(await api<Expense>(path, { method: 'POST', body: form }))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not save this expense.')
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  return (
+    <Modal title={expense ? 'Add expense receipt' : 'Record expense'} busy={Boolean(busy)} onClose={onClose}>
+      {expense
+        ? <p className="dialog-intro">{expense.expenseId} · {expense.description} · {formatMoney(expense.amount, expense.currency)}</p>
+        : <div className="segments expense-modes" aria-label="Expense entry method">
+          <button type="button" aria-pressed={mode === 'receipt'} disabled={Boolean(busy)} onClick={() => {
+            setError('')
+            setMode('receipt')
+          }}>Upload receipt</button>
+          <button type="button" aria-pressed={mode === 'manual'} disabled={Boolean(busy)} onClick={() => {
+            setError('')
+            setMode('manual')
+            if (receiptRead) {
+              setReceiptRead(false)
+              setDraft(({ description, vendor, paymentDate, currency, amount }) => ({ description, vendor, paymentDate, currency, amount }))
+            }
+          }}>Enter manually</button>
+        </div>}
+      <form className="dialog-form" key={mode} onSubmit={(event) => {
+        event.preventDefault()
+        if (reading) void readReceipt()
+        else void save()
+      }}>
+        {mode === 'receipt' && <label>Receipt or payment screenshot
+          <input type="file" accept={fileTypes} disabled={Boolean(busy)} onChange={(event) => {
+            setFile(event.currentTarget.files?.[0])
+            setReceiptRead(false)
+            setError('')
+          }} />
+        </label>}
+        {mode === 'receipt' && file && <small className="filename">{file.name}</small>}
+        {!reading && <>
+          {!expense && <label>What did you pay for?
+            <input value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })}
+              placeholder="e.g. Whiteboard" maxLength={160} required disabled={Boolean(busy)} />
+          </label>}
+          <div className="expense-fields">
+            <label>Amount paid
+              <input value={draft.amount} onChange={(event) => setDraft({ ...draft, amount: event.target.value })}
+                inputMode="decimal" pattern={'(?:0|[1-9][0-9]{0,12})(?:[.][0-9]{1,2})?'} required disabled={Boolean(busy) || Boolean(expense)} />
+            </label>
+            <label>Currency
+              <input value={draft.currency} onChange={(event) => setDraft({ ...draft, currency: event.target.value.toUpperCase() })}
+                maxLength={3} pattern="[A-Z]{3}" required disabled={Boolean(busy) || Boolean(expense)} />
+            </label>
+          </div>
+          <label>Payment date
+            <input type="date" value={draft.paymentDate} onChange={(event) => setDraft({ ...draft, paymentDate: event.target.value })}
+              required disabled={Boolean(busy) || Boolean(expense)} />
+          </label>
+          <label>Vendor <span className="optional">(optional)</span>
+            <input value={draft.vendor} onChange={(event) => setDraft({ ...draft, vendor: event.target.value })}
+              maxLength={160} disabled={Boolean(busy)} />
+          </label>
+          {mode === 'receipt' && draft.receiptNumber && <small>Receipt {draft.receiptNumber}</small>}
+        </>}
+        {error && <p className="inline-error" role="alert">{error}</p>}
+        <button className="button button-primary" type="submit" disabled={Boolean(busy) || (mode === 'receipt' && !file)}>
+          {busy === 'read' ? 'Reading receipt…' : busy === 'save' ? 'Saving…'
+            : reading ? 'Read receipt' : expense ? 'Save receipt' : 'Save paid expense'}
+        </button>
+      </form>
+    </Modal>
+  )
+}
+
+function LinkExpense({ expense, invoices, onClose, onSave }: {
+  expense: Expense
+  invoices: Invoice[]
+  onClose: () => void
+  onSave: (expense: Expense) => void
+}) {
+  const [invoiceId, setInvoiceId] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  async function link() {
+    setBusy(true)
+    setError('')
+    try {
+      onSave(await api<Expense>('/api/expenses/' + expense.id + '/link-invoice', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ invoiceId }),
+      }))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not link this expense.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <Modal title="Link expense to invoice" busy={busy} onClose={onClose}>
+    <p className="dialog-intro">{formatMoney(expense.amount, expense.currency)} paid on {formatDate(expense.paymentDate)} for {expense.description}.</p>
+    <form className="dialog-form" onSubmit={(event) => { event.preventDefault(); void link() }}>
+      <label>Invoice
+        <select value={invoiceId} disabled={busy} onChange={(event) => setInvoiceId(event.target.value)} required>
+          <option value="">Select invoice</option>
+          {invoices.filter((invoice) => invoice.currency === expense.currency && invoice.total).map((invoice) =>
+            <option key={invoice.id} value={invoice.id}>{[invoice.invoiceId, invoice.vendor, invoice.invoiceNumber,
+              formatMoney(invoice.total, invoice.currency)].filter(Boolean).join(' · ')}</option>,
+          )}
+        </select>
+      </label>
+      {error && <p className="inline-error" role="alert">{error}</p>}
+      <button className="button button-primary" type="submit" disabled={busy || !invoiceId}>{busy ? 'Linking…' : 'Confirm payment link'}</button>
+    </form>
+  </Modal>
+}
+
+function ExpenseList({ expenses, onReceipt, onLink }: {
+  expenses: Expense[]
+  onReceipt: (expense: Expense) => void
+  onLink: (expense: Expense) => void
+}) {
+  const [showAll, setShowAll] = useState(false)
+  return <section className="register" aria-labelledby="expenses-title">
+    <div className="register-heading expense-heading"><h2 id="expenses-title">Expenses without invoices</h2></div>
+    {!expenses.length && <p className="empty-state">No expenses in this period.</p>}
+    <ul className="invoice-list">
+      {(showAll ? expenses : expenses.slice(0, pageSize)).map((expense) => (
+        <li className="invoice-item" key={expense.id}>
+          <details className="expense-detail">
+            <summary className="invoice-row">
+              <span className="invoice-identity">
+                <strong>{expense.description}</strong>
+                <small>{[expense.expenseId, expense.vendor, formatDate(expense.paymentDate)].filter(Boolean).join(' · ')}</small>
+              </span>
+              <span className="invoice-amount">{formatMoney(expense.amount, expense.currency)}</span>
+              <span className="invoice-state">
+                <span className={'status ' + (expense.hasReceipt || expense.linkedInvoice ? 'status-paid' : 'status-unpaid')}>
+                  {expense.linkedInvoice ?? (expense.hasReceipt ? 'Paid' : 'Paid · No receipt')}
+                </span>
+                {expense.syncPending && <small>Sync pending</small>}
+              </span>
+              <Chevron expanded={false} />
+            </summary>
+            <div className="invoice-details detail-actions">
+              {expense.receiptUrl && <a className="button button-outline" href={expense.receiptUrl} target="_blank" rel="noreferrer">Open receipt ↗</a>}
+              {!expense.hasReceipt && <button className="button button-outline" type="button" onClick={() => onReceipt(expense)}>Add receipt</button>}
+              {!expense.linkedInvoice && <button className="button button-outline" type="button" onClick={() => onLink(expense)}>Link to invoice</button>}
+              {expense.hasReceipt && !expense.receiptUrl && <small>Receipt sync pending</small>}
+              {expense.linkedInvoice && <small>Linked to {expense.linkedInvoice}</small>}
+            </div>
+          </details>
+        </li>
+      ))}
+    </ul>
+    {expenses.length > pageSize && <button type="button" aria-expanded={showAll} className="show-button" onClick={() => setShowAll(!showAll)}>
+      {showAll ? 'Show less' : 'Show all expenses'} <Chevron expanded={showAll} />
+    </button>}
+  </section>
+}
+
 export default function App({ user, onLogout }: { user: { name: string }; onLogout: () => void }) {
   const [dashboard, setDashboard] = useState<Dashboard>()
+  const [expenses, setExpenses] = useState<Expense[]>([])
+  const [expenseLoadError, setExpenseLoadError] = useState('')
+  const [expenseForm, setExpenseForm] = useState<{ expense?: Expense; file?: File }>()
+  const [expenseLink, setExpenseLink] = useState<Expense>()
   const [loadError, setLoadError] = useState('')
   const [notice, setNotice] = useState('')
   const [uploadError, setUploadError] = useState('')
@@ -196,7 +441,7 @@ export default function App({ user, onLogout }: { user: { name: string }; onLogo
   const [showAll, setShowAll] = useState(false)
   const [expandedId, setExpandedId] = useState<string>()
   const [busy, setBusy] = useState<'invoice' | 'receipt' | 'review'>()
-  const [receipt, setReceipt] = useState<{ invoice?: Invoice; file?: File }>()
+  const [receipt, setReceipt] = useState<{ invoice: Invoice; file?: File }>()
   const [payer, setPayer] = useState('')
   const [review, setReview] = useState<{ id: string; invoiceId: string }>()
   const [modalError, setModalError] = useState('')
@@ -206,19 +451,25 @@ export default function App({ user, onLogout }: { user: { name: string }; onLogo
 
   const load = useCallback(async (signal?: AbortSignal) => {
     const id = ++requestId.current
-    try {
-      const next = await api<Dashboard>('/api/invoices', { signal })
-      if (id === requestId.current && !signal?.aborted) {
-        setDashboard(next)
-        setLoadError('')
-      }
-    } catch (error) {
-      if (id === requestId.current && !signal?.aborted) {
-        setLoadError(error instanceof Error ? error.message : 'Could not load invoices.')
-      }
+    const [invoiceResult, expenseResult] = await Promise.allSettled([
+      api<Dashboard>('/api/invoices', { signal }),
+      api<{ expenses: Expense[] }>('/api/expenses', { signal }),
+    ])
+    if (id !== requestId.current || signal?.aborted) return
+    if (invoiceResult.status === 'fulfilled') {
+      setDashboard(invoiceResult.value)
+      setLoadError('')
+    } else {
+      setLoadError(invoiceResult.reason instanceof Error ? invoiceResult.reason.message : 'Could not load invoices.')
+    }
+    if (expenseResult.status === 'fulfilled') {
+      setExpenses(expenseResult.value.expenses)
+      setExpenseLoadError('')
+    } else {
+      setExpenseLoadError('Could not load expenses.')
     }
   }, [])
-  const syncing = dashboard?.invoices.some((invoice) => invoice.syncPending) ?? false
+  const syncing = dashboard?.invoices.some((invoice) => invoice.syncPending) || expenses.some((expense) => expense.syncPending)
   useEffect(() => {
     const controller = new AbortController()
     queueMicrotask(() => { if (!controller.signal.aborted) void load(controller.signal) })
@@ -237,7 +488,13 @@ export default function App({ user, onLogout }: { user: { name: string }; onLogo
 
   const invoices = dashboard?.invoices ?? []
   const vendorOptions = [...new Set(invoices.flatMap((invoice) => invoice.vendor ? [invoice.vendor] : []))].sort((a, b) => a.localeCompare(b))
-  const yearOptions = [...new Set(invoices.flatMap((invoice) => invoice.invoiceDate ? [invoice.invoiceDate.slice(0, 4)] : []))].sort().reverse()
+  const yearOptions = [...new Set([
+    ...invoices.flatMap((invoice) => invoice.invoiceDate ? [invoice.invoiceDate.slice(0, 4)] : []),
+    ...expenses.map((expense) => expense.paymentDate.slice(0, 4)),
+  ])].sort().reverse()
+  const visibleExpenses = expenses.filter((expense) =>
+    (!month || expense.paymentDate.slice(5, 7) === month) && (!year || expense.paymentDate.slice(0, 4) === year),
+  )
   const query = search.trim().toLowerCase()
   const matches = invoices.filter((invoice) =>
     (!query || [invoice.vendor, invoice.invoiceId, invoice.invoiceNumber].some((value) => value?.toLowerCase().includes(query))) &&
@@ -250,10 +507,22 @@ export default function App({ user, onLogout }: { user: { name: string }; onLogo
   const narrowed = Boolean(query || vendor || month || year || awaiting)
   const pendingReview = dashboard?.reviews.find((row) => row.id === review?.id)
 
-  function openReceipt(invoice?: Invoice, file?: File) {
+  function openReceipt(invoice: Invoice) {
     setModalError('')
     setPayer('')
-    setReceipt({ invoice, file })
+    setReceipt({ invoice })
+  }
+
+  function handleExpenseSave(saved: Expense) {
+    if (expenseForm && !expenseForm.expense) {
+      setMonth('')
+      setYear('')
+    }
+    setExpenseForm(undefined)
+    setExpenseLink(undefined)
+    setNotice(saved.expenseId + (saved.linkedInvoice ? ' linked to ' + saved.linkedInvoice + '.' : ' saved.'))
+    setUploadError('')
+    void load()
   }
 
   function resetListView() {
@@ -335,7 +604,7 @@ export default function App({ user, onLogout }: { user: { name: string }; onLogo
       <main className="workspace">
         <div className="page-title">
           <h1>Invoice Manager</h1>
-          <p>Track vendor invoices and payment proof.</p>
+          <p>Track invoices, payment proof, and expenses.</p>
         </div>
 
         <input ref={invoicePicker} type="file" accept={fileTypes} hidden onChange={(event) => {
@@ -348,7 +617,7 @@ export default function App({ user, onLogout }: { user: { name: string }; onLogo
             <button
               type="button" key={kind} disabled={Boolean(busy)}
               className={'upload-action upload-' + kind + (dragged === kind ? ' dragging' : '')}
-              onClick={() => kind === 'invoice' ? invoicePicker.current?.click() : openReceipt()}
+              onClick={() => kind === 'invoice' ? invoicePicker.current?.click() : setExpenseForm({})}
               onDragOver={(event) => { event.preventDefault(); if (!busy) setDragged(kind) }}
               onDragLeave={() => setDragged(undefined)}
               onDrop={(event) => {
@@ -357,13 +626,13 @@ export default function App({ user, onLogout }: { user: { name: string }; onLogo
                 const file = event.dataTransfer.files[0]
                 if (file && !busy) {
                   if (kind === 'invoice') void uploadFile('invoice', file)
-                  else openReceipt(undefined, file)
+                  else setExpenseForm({ file })
                 }
               }}
             >
               <span className="upload-icon" aria-hidden="true">{kind === 'invoice' ? '↑' : '+'}</span>
-              <span><strong>{busy === kind ? 'Reading ' + kind + '…' : kind === 'invoice' ? 'Upload invoice' : 'Upload receipt'}</strong>
-                <small>{kind === 'invoice' ? 'Add a new vendor bill' : 'Match proof to an invoice'}</small></span>
+              <span><strong>{kind === 'invoice' ? busy === 'invoice' ? 'Reading invoice…' : 'Upload invoice' : 'Record expense'}</strong>
+                <small>{kind === 'invoice' ? 'Add a new vendor bill' : 'With or without a receipt'}</small></span>
               <span className="upload-arrow" aria-hidden="true">↗</span>
             </button>
           ))}
@@ -456,15 +725,20 @@ export default function App({ user, onLogout }: { user: { name: string }; onLogo
               setShowAll(!showAll)
             }}>{showAll ? 'Show less' : 'Show all invoices'} <Chevron expanded={showAll} /></button>}
         </section>
+        {expenseLoadError && <p className="feedback feedback-error" role="alert">{expenseLoadError} <button className="quiet-link" type="button" onClick={() => void load()}>Retry</button></p>}
+        {!!expenses.length && <ExpenseList expenses={visibleExpenses}
+          onReceipt={(expense) => setExpenseForm({ expense })} onLink={setExpenseLink} />}
       </main>
 
+      {expenseForm && <ExpenseForm expense={expenseForm.expense} initialFile={expenseForm.file}
+        onClose={() => setExpenseForm(undefined)} onSave={handleExpenseSave} />}
+      {expenseLink && <LinkExpense expense={expenseLink} invoices={invoices}
+        onClose={() => setExpenseLink(undefined)} onSave={handleExpenseSave} />}
       {receipt && <Modal title="Upload receipt" busy={Boolean(busy)} onClose={() => setReceipt(undefined)}>
-        <p className="dialog-intro">{receipt.invoice
-          ? [receipt.invoice.invoiceId, receipt.invoice.vendor, receipt.invoice.invoiceNumber].filter(Boolean).join(' · ')
-          : 'Choose a receipt or payment screenshot to match.'}</p>
+        <p className="dialog-intro">{[receipt.invoice.invoiceId, receipt.invoice.vendor, receipt.invoice.invoiceNumber].filter(Boolean).join(' · ')}</p>
         <form className="dialog-form" onSubmit={(event) => {
           event.preventDefault()
-          if (receipt.file) void uploadFile('receipt', receipt.file, receipt.invoice?.id)
+          if (receipt.file) void uploadFile('receipt', receipt.file, receipt.invoice.id)
         }}>
           <label>Payment proof
             <input type="file" accept={fileTypes} disabled={Boolean(busy)} onChange={(event) => {

@@ -6,6 +6,7 @@ import multer from 'multer'
 import { z } from 'zod'
 import { extractInvoice } from '../services/invoiceExtractor.js'
 import { findDuplicateDocument, storeInvoice, storeReceipt } from '../services/invoiceRecords.js'
+import type { WorkFile } from '../services/invoiceRecords.js'
 import { InvoiceWorkflowError } from '../services/invoiceWorkflow.js'
 import { runInvoiceSync } from '../services/sheetSyncWorker.js'
 
@@ -30,7 +31,7 @@ export function sendWorkflowError(res: Response, error: unknown) {
   }
 }
 
-router.post('/', (req, res, next) => {
+export const acceptDocument: import('express').RequestHandler = (req, res, next) => {
   upload(req, res, (error: unknown) => {
     if (!error) {
       next()
@@ -41,7 +42,21 @@ router.post('/', (req, res, next) => {
       : 'Choose one PDF, JPG, or PNG to upload.'
     res.status(400).json({ error: message })
   })
-}, async (req, res) => {
+}
+
+export async function readUploadedDocument(uploaded: Express.Multer.File): Promise<WorkFile> {
+  const { originalname, buffer } = uploaded
+  const detected = await fileTypeFromBuffer(buffer).catch(() => undefined)
+  if (!detected || !allowed.has(detected.mime)) {
+    throw new InvoiceWorkflowError('Choose a valid PDF, JPG, or PNG.', 415)
+  }
+  return {
+    filename: originalname, mimeType: detected.mime, buffer,
+    hash: createHash('sha256').update(buffer).digest('hex'),
+  }
+}
+
+router.post('/', acceptDocument, async (req, res) => {
   const input = document.safeParse(req.body)
   const actor = req.session.user?.email
   const uploaded = req.file
@@ -50,24 +65,18 @@ router.post('/', (req, res, next) => {
     return
   }
   const { kind, invoiceId, paidBy } = input.data
-  const { originalname, buffer } = uploaded
   try {
-    const detected = await fileTypeFromBuffer(buffer).catch(() => undefined)
-    if (!detected || !allowed.has(detected.mime)) {
-      throw new InvoiceWorkflowError('Choose a valid PDF, JPG, or PNG.', 415)
-    }
-    const hash = createHash('sha256').update(buffer).digest('hex')
-    const existing = await findDuplicateDocument(hash, kind, invoiceId)
+    const file = await readUploadedDocument(uploaded)
+    const existing = await findDuplicateDocument(file.hash, kind, invoiceId)
     if (existing) {
       void runInvoiceSync()
       res.json(existing)
       return
     }
 
-    const extraction = await extractInvoice(buffer, detected.mime).catch(() => {
+    const extraction = await extractInvoice(file.buffer, file.mimeType).catch(() => {
       throw new InvoiceWorkflowError('The document reader could not return a complete result. Try again with a clear PDF or image.', 502)
     })
-    const file = { filename: originalname, mimeType: detected.mime, hash, buffer }
     const result = kind === 'invoice'
       ? await storeInvoice(file, extraction)
       : await storeReceipt(file, extraction, actor, invoiceId, paidBy)

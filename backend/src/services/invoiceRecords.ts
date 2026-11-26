@@ -52,7 +52,7 @@ export type PaymentRow = {
 
 type Client = Pick<PoolClient, 'query'>
 type DocumentType = 'invoice' | 'receipt'
-type WorkFile = {
+export type WorkFile = {
   filename: string
   mimeType: string
   hash: string
@@ -118,9 +118,15 @@ export async function getPayments(invoiceId: string, client: Client = pool): Pro
     SELECT p.id::text, a.amount::text, p.currency, p.payment_date::text AS date,
       p.payer_name AS "paidBy", p.reference,
       (
-        SELECT COALESCE(json_agg(json_build_object('url', d.drive_file_url) ORDER BY d.id), '[]'::json)
-        FROM invoice_payment_receipts r JOIN invoices d ON d.id = r.receipt_id
-        WHERE r.payment_id = p.id AND d.drive_status = 'uploaded' AND d.drive_file_url IS NOT NULL
+        SELECT COALESCE(json_agg(json_build_object('url', proof.url) ORDER BY proof.id), '[]'::json)
+        FROM (
+          SELECT d.id, d.drive_file_url AS url
+          FROM invoice_payment_receipts r JOIN invoices d ON d.id = r.receipt_id
+          WHERE r.payment_id = p.id AND d.drive_status = 'uploaded' AND d.drive_file_url IS NOT NULL
+          UNION ALL
+          SELECT e.id, e.receipt_url
+          FROM standalone_expenses e WHERE e.linked_payment_id = p.id AND e.receipt_url IS NOT NULL
+        ) proof
       ) AS receipts
     FROM invoice_payment_allocations a
     JOIN invoice_payments p ON p.id = a.payment_id
@@ -141,7 +147,9 @@ export async function listReviews(): Promise<ReviewRow[]> {
   return (await pool.query<ReviewRow>(`
     SELECT i.id::text, i.filename, w.target_invoice_id::text AS "targetInvoiceId", w.proof
     FROM invoice_work_files w JOIN invoices i ON i.id = w.document_id
-    WHERE w.state = 'review' ORDER BY i.id DESC
+    WHERE w.state = 'review'
+      AND NOT EXISTS (SELECT 1 FROM standalone_expenses e WHERE e.receipt_sha256 = i.sha256)
+    ORDER BY i.id DESC
   `)).rows
 }
 
@@ -169,7 +177,11 @@ export async function findDuplicateDocument(
     throw new InvoiceWorkflowError('This file is already stored as another document. Choose a separate original.', 409)
   }
   if (kind === 'invoice') return { kind: 'duplicate', invoiceId: row.id }
-  if (row.state === 'review') return { kind: 'review', invoiceId: targetId ?? row.invoice_id, reviewId: row.id }
+  if (row.state === 'review') {
+    const { rowCount } = await client.query('SELECT 1 FROM standalone_expenses WHERE receipt_sha256 = $1', [hash])
+    if (rowCount) throw new InvoiceWorkflowError('This receipt is already in Expenses without invoices. Open the expense to link it.', 409)
+    return { kind: 'review', invoiceId: targetId ?? row.invoice_id, reviewId: row.id }
+  }
   if (targetId && row.invoice_id && row.invoice_id !== targetId) {
     throw new InvoiceWorkflowError('This receipt is already attached to another invoice.', 409)
   }
@@ -242,7 +254,7 @@ export async function storeInvoice(file: WorkFile, extraction: ExtractedInvoice)
   })
 }
 
-async function paymentByReference(proof: ReceiptProof, client: Client) {
+export async function paymentByReference(proof: Pick<ReceiptProof, 'transactionReference' | 'currency'>, client: Client) {
   const key = proof.transactionReference && normalizePaymentReference(proof.transactionReference)
   if (!key) return undefined
   const { rows } = await client.query<{ id: string; amount: string; invoice_id: string | null }>(`
@@ -295,7 +307,30 @@ async function attachReceipt(client: Client, documentId: string, invoiceId: stri
 
   const duplicate = await duplicatePayment(proof, client, invoiceId)
   if (duplicate) return duplicate
-  const key = proof.transactionReference && normalizePaymentReference(proof.transactionReference)
+  const paymentId = await recordInvoicePayment(client, invoiceId, proof, actor)
+  await client.query(`
+    INSERT INTO invoice_payment_receipts (receipt_id, payment_id, attached_by) VALUES ($1, $2, $3)
+  `, [documentId, paymentId, actor])
+  await client.query(`
+    UPDATE invoice_work_files SET state = 'ready', target_invoice_id = $2, payment_id = $3,
+      receipt_number = (
+        SELECT COUNT(*) FROM invoice_payment_receipts r
+        JOIN invoice_payment_allocations a ON a.payment_id = r.payment_id
+        WHERE a.invoice_id = $2
+      ),
+      available_at = NOW()
+    WHERE document_id = $1
+  `, [documentId, invoiceId, paymentId])
+  return { kind: 'receipt', invoiceId } as const
+}
+
+export async function recordInvoicePayment(
+  client: Client,
+  invoiceId: string,
+  proof: Pick<ReceiptProof, 'amount' | 'currency' | 'paymentDate' | 'transactionReference' | 'method' | 'paidBy'>,
+  actor: string,
+): Promise<string> {
+  const key = proof.transactionReference ? normalizePaymentReference(proof.transactionReference) || null : null
   const sameAmountAndDate = await client.query(`
     SELECT 1 FROM invoice_payment_allocations a
     JOIN invoice_payments p ON p.id = a.payment_id
@@ -316,27 +351,31 @@ async function attachReceipt(client: Client, documentId: string, invoiceId: stri
     INSERT INTO invoice_payment_allocations (payment_id, invoice_id, amount, allocated_by)
     VALUES ($1, $2, $3, $4)
   `, [payment.id, invoiceId, proof.amount, actor])
-  await client.query(`
-    INSERT INTO invoice_payment_receipts (receipt_id, payment_id, attached_by) VALUES ($1, $2, $3)
-  `, [documentId, payment.id, actor])
-  await client.query(`
-    UPDATE invoice_work_files SET state = 'ready', target_invoice_id = $2, payment_id = $3,
-      receipt_number = (
-        SELECT COUNT(*) FROM invoice_payment_receipts r
-        JOIN invoice_payment_allocations a ON a.payment_id = r.payment_id
-        WHERE a.invoice_id = $2
-      ),
-      available_at = NOW()
-    WHERE document_id = $1
-  `, [documentId, invoiceId, payment.id])
-  return { kind: 'receipt', invoiceId } as const
+  return payment.id
 }
 
-async function lockPaymentReference(proof: ReceiptProof, client: Client) {
+export async function lockPaymentReference(proof: Pick<ReceiptProof, 'transactionReference' | 'currency'>, client: Client) {
   if (!proof.transactionReference) return
   await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
     'invoice-payment:' + proof.currency + ':' + normalizePaymentReference(proof.transactionReference),
   ])
+}
+
+async function checkStandaloneReceipt(client: Client, proof: ReceiptProof, sha256?: string, receiptNumber?: string | null) {
+  const key = proof.transactionReference && normalizePaymentReference(proof.transactionReference)
+  const numberKey = receiptNumber && normalizePaymentReference(receiptNumber)
+  const { rows: [expense] } = await client.query<{ linked_invoice_id: string | null }>(`
+    SELECT linked_invoice_id FROM standalone_expenses
+    WHERE receipt_sha256 = $1 OR (currency = $2 AND reference_key = $3)
+       OR (vendor_key = $4 AND receipt_number_key = $5)
+    LIMIT 1
+  `, [sha256 ?? null, proof.currency, key, proof.vendorKey, numberKey || null])
+  if (expense) {
+    const message = expense.linked_invoice_id
+      ? 'This payment is already linked to ' + invoiceCode(expense.linked_invoice_id) + '.'
+      : 'This payment is in Expenses without invoices. Open that expense and use Link to invoice.'
+    throw new InvoiceWorkflowError(message, 409)
+  }
 }
 
 export async function storeReceipt(
@@ -352,6 +391,7 @@ export async function storeReceipt(
       throw new InvoiceWorkflowError('That invoice no longer exists. Choose another invoice.', 404)
     }
     await lockPaymentReference(proof, client)
+    await checkStandaloneReceipt(client, proof, file.hash, extraction.document_type === 'receipt' ? extraction.invoice_number : null)
     const paymentDuplicate = await duplicatePayment(proof, client, targetId)
     if (paymentDuplicate) return paymentDuplicate
 
@@ -376,6 +416,10 @@ export async function storeReceipt(
 
 export async function confirmReceipt(documentId: string, invoiceId: string, actor: string): Promise<UploadResult> {
   return transaction(async (client) => {
+    const { rows: [file] } = await client.query<{ sha256: string }>('SELECT sha256 FROM invoices WHERE id = $1', [documentId])
+    if (file) {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['invoice-document:' + file.sha256])
+    }
     const { rows: [work] } = await client.query<{ proof: ReceiptProof }>(`
       SELECT proof FROM invoice_work_files WHERE document_id = $1 AND state = 'review' FOR UPDATE
     `, [documentId])
@@ -384,6 +428,7 @@ export async function confirmReceipt(documentId: string, invoiceId: string, acto
     }
 
     await lockPaymentReference(work.proof, client)
+    await checkStandaloneReceipt(client, work.proof, file?.sha256)
     const result = await attachReceipt(client, documentId, invoiceId, work.proof, actor)
     if (result.kind === 'duplicate') {
       await client.query('DELETE FROM invoices WHERE id = $1', [documentId])

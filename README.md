@@ -116,9 +116,11 @@
 ## Invoice and receipt workflow
 
 - Upload an invoice to create an unpaid record. The Drive filename and Sheets row use the same internal invoice ID.
-- Upload payment proof separately, or open an invoice and use **Upload receipt**. A clear match attaches automatically. Ambiguous proofs remain available for review.
+- Open an invoice and use **Upload receipt** to attach payment proof. A clear match attaches automatically. Ambiguous proofs remain available for review.
 - The app stores individual verified payments, including multiple payments for the same invoice. The original invoice amount stays fixed. The balance and overpayment are calculated from those payments.
 - Google Drive stores invoices and receipts in `Merchant Payment Invoices / Vendor / Invoice Year`. The same invoice month and ID appear on both filenames. Google Sheets syncs one row per invoice. A failed Drive or Sheets sync retries from PostgreSQL.
+- Use **Record expense** for a payment without an invoice. Upload a receipt or enter the payment details manually. The app syncs these expenses to `EXPENSES_LIVE` and saves their receipts directly in `Expenses Without Invoices`.
+- Open an expense to add a receipt later or link the recorded payment to an invoice. For spending reports, add `Standalone Spend` from `EXPENSES_LIVE` to invoice payments. Linking a payment moves its value into the invoice totals.
 
 ## Configure and run
 

@@ -4,6 +4,7 @@ import pool from '../db/postgres.js'
 import { googleOAuthClient } from './googleAuth.js'
 
 const folderMimeType = 'application/vnd.google-apps.folder'
+const shortcutMimeType = 'application/vnd.google-apps.shortcut'
 const requestOptions = { timeout: 20_000 }
 
 function driveClient() {
@@ -91,15 +92,52 @@ export async function invoiceYearFolder(vendor: string, year: string): Promise<s
   return ensureFolder(await ensureFolder(root, vendor), year)
 }
 
-export async function saveInvoiceFile(input: {
+export async function expenseFolder(): Promise<string> {
+  const root = process.env.GOOGLE_DRIVE_FOLDER_ID
+  if (!root) throw new Error('GOOGLE_DRIVE_FOLDER_ID is missing')
+  return ensureFolder(root, 'Expenses Without Invoices')
+}
+
+export async function ensureExpenseSheetShortcut(folderId: string, targetId: string): Promise<void> {
+  const drive = driveClient()
+  const shortcuts = await drive.files.list({
+    q: "'" + escapeQuery(folderId) + "' in parents and trashed = false and mimeType = '" + shortcutMimeType + "'",
+    fields: 'nextPageToken,files(shortcutDetails(targetId))',
+    pageSize: 100,
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+  }, requestOptions)
+  if (shortcuts.data.files?.some((file) => file.shortcutDetails?.targetId === targetId)) return
+  if (shortcuts.data.nextPageToken) throw new Error('The expense folder has too many shortcuts to check')
+  await drive.files.create({
+    supportsAllDrives: true,
+    requestBody: {
+      name: 'Expense register',
+      mimeType: shortcutMimeType,
+      parents: [folderId],
+      shortcutDetails: { targetId },
+    },
+    fields: 'id',
+  }, requestOptions)
+}
+
+type DriveDocument = {
   fileId: string
   parentId: string
   filename: string
   mimeType: string
   content: Buffer
-  invoiceId: string
-  documentId: string
-}): Promise<string> {
+}
+
+export function saveInvoiceFile(input: DriveDocument & { invoiceId: string; documentId: string }) {
+  return saveDriveDocument(input, { invoiceId: input.invoiceId, documentId: input.documentId })
+}
+
+export function saveExpenseFile(input: DriveDocument & { expenseId: string }) {
+  return saveDriveDocument(input, { expenseId: input.expenseId })
+}
+
+async function saveDriveDocument(input: DriveDocument, properties: Record<string, string>): Promise<string> {
   const drive = driveClient()
   let link: string | null | undefined
   try {
@@ -109,7 +147,7 @@ export async function saveInvoiceFile(input: {
         id: input.fileId,
         name: input.filename,
         parents: [input.parentId],
-        appProperties: { invoiceId: input.invoiceId, documentId: input.documentId },
+        appProperties: properties,
       },
       media: { mimeType: input.mimeType, body: Readable.from(input.content) },
       fields: 'id,webViewLink',
@@ -121,9 +159,9 @@ export async function saveInvoiceFile(input: {
     const existing = await drive.files.get({
       fileId: input.fileId, supportsAllDrives: true, fields: 'id,parents,trashed,appProperties,webViewLink',
     }, requestOptions)
-    if (existing.data.trashed || existing.data.appProperties?.documentId !== input.documentId ||
+    if (existing.data.trashed || Object.entries(properties).some(([key, value]) => existing.data.appProperties?.[key] !== value) ||
         !existing.data.parents?.includes(input.parentId)) {
-      throw new Error('The reserved Drive document is outside its invoice folder')
+      throw new Error('The reserved Drive document is outside its expected folder')
     }
     link = existing.data.webViewLink
   }

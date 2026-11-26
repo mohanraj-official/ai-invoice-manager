@@ -14,6 +14,10 @@ export function invoiceCode(id: string | number): string {
   return 'INV' + String(id).padStart(3, '0')
 }
 
+export function expenseCode(id: string): string {
+  return 'EXP-' + id.padStart(3, '0')
+}
+
 export function normalizeInvoiceNumber(number: string): string {
   return number.normalize('NFKC').toLowerCase().trim().replace(/\s+/g, ' ')
 }
@@ -175,4 +179,11 @@ export function documentFilename(invoiceId: string, date: string, mimeType: stri
     ? '1_INVOICE'
     : '2_RECEIPT' + (receiptNumber > 1 ? '_' + String(receiptNumber).padStart(2, '0') : '')
   return [year + '-' + month, monthName, invoiceCode(invoiceId), kind].join('_') + '.' + extension
+}
+
+export function expenseFilename(id: string, date: string, description: string, mimeType: string): string {
+  const extension = extensions[mimeType]
+  if (!extension) throw new Error('Cannot name an expense receipt without a valid format')
+  const label = description.normalize('NFKC').replace(/[^\p{L}\p{N}]+/gu, '-').slice(0, 80).replace(/^-|-$/g, '')
+  return [date, expenseCode(id), label || 'Receipt'].join('_') + '.' + extension
 }

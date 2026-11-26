@@ -1,7 +1,9 @@
 import { google, type sheets_v4 } from 'googleapis'
 import { googleOAuthClient } from './googleAuth.js'
-import { invoiceCode } from './invoiceWorkflow.js'
+import { expenseCode, invoiceCode } from './invoiceWorkflow.js'
 import type { InvoiceRow, PaymentRow } from './invoiceRecords.js'
+import { expenseStatus } from './expenseRecords.js'
+import type { ExpenseRow } from './expenseRecords.js'
 
 const legacyHeaders = [
   'Invoice ID', 'Invoice Number', 'Invoice Date', 'Due Date', 'Vendor', 'Vendor Tax ID',
@@ -16,6 +18,13 @@ export const invoiceHeaders = [
   'Document Type', 'Description', 'Receipt / Payment Proof', 'Payment Date', 'Amount Paid', 'Balance Due',
   'Overpayment',
 ]
+
+export const expenseTab = 'EXPENSES_LIVE'
+const expenseHeaders = [
+  'Expense ID', 'Payment Date', 'Description', 'Vendor', 'Currency', 'Amount Paid',
+  'Status', 'Receipt / Payment Proof', 'Receipt Number', 'Payment Reference', 'Linked Invoice', 'Standalone Spend',
+]
+const expenseRange = "'" + expenseTab + "'!"
 
 const cellFields = 'userEnteredValue,textFormatRuns,userEnteredFormat.numberFormat'
 const requestOptions = { timeout: 20_000 }
@@ -145,4 +154,84 @@ export async function saveInvoiceToSheet(invoice: InvoiceRow, payments: PaymentR
     ? { appendCells: { sheetId, rows, fields: cellFields } }
     : { updateCells: { start: { sheetId, rowIndex, columnIndex: 0 }, rows, fields: cellFields } })
   await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } }, requestOptions)
+}
+
+export async function ensureExpenseSheet(spreadsheetId: string): Promise<number> {
+  if (process.env.GOOGLE_SHEET_TAB === expenseTab) throw new Error('The invoice and expense tabs must have different names')
+  const sheets = google.sheets({ version: 'v4', auth: googleOAuthClient })
+  const metadata = await sheets.spreadsheets.get({
+    spreadsheetId, fields: 'sheets(properties(sheetId,title,gridProperties(columnCount)))',
+  }, requestOptions)
+  const existing = metadata.data.sheets?.find((item) => item.properties?.title === expenseTab)?.properties
+  let sheetId = existing?.sheetId
+  if (sheetId === undefined || sheetId === null) {
+    const created = await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: [{ addSheet: { properties: {
+        title: expenseTab,
+        gridProperties: { columnCount: expenseHeaders.length, frozenRowCount: 1 },
+      } } }] },
+    }, requestOptions)
+    sheetId = created.data.replies?.[0]?.addSheet?.properties?.sheetId
+  }
+  if (sheetId === undefined || sheetId === null) throw new Error('Expense sheet tab was not found')
+  const wholeTab = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: expenseRange + '1:1', valueRenderOption: 'UNFORMATTED_VALUE',
+  }, requestOptions)
+  const headers = wholeTab.data.values?.[0] ?? []
+  if (JSON.stringify(headers.slice(0, expenseHeaders.length)) === JSON.stringify(expenseHeaders)) return sheetId
+  if (headers.length) throw new Error('The existing expense tab has a different header')
+  const empty = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: "'" + expenseTab + "'", valueRenderOption: 'FORMULA',
+  }, requestOptions)
+  if (empty.data.values?.some((row) => row.some((cell) => cell !== '' && cell !== null))) {
+    throw new Error('The expense tab has existing data without a header')
+  }
+  const requests: sheets_v4.Schema$Request[] = []
+  const columns = existing?.gridProperties?.columnCount ?? expenseHeaders.length
+  if (columns < expenseHeaders.length) {
+    requests.push({ appendDimension: { sheetId, dimension: 'COLUMNS', length: expenseHeaders.length - columns } })
+  }
+  requests.push({ updateCells: {
+    start: { sheetId, columnIndex: 0, rowIndex: 0 },
+    rows: [{ values: expenseHeaders.map(textCell) }],
+    fields: 'userEnteredValue',
+  } })
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } }, requestOptions)
+  return sheetId
+}
+
+export async function saveExpenseToSheet(spreadsheetId: string, sheetId: number, expense: ExpenseRow): Promise<void> {
+  const sheets = google.sheets({ version: 'v4', auth: googleOAuthClient })
+  const register = await sheets.spreadsheets.values.batchGet({
+    spreadsheetId, ranges: [expenseRange + '1:1', expenseRange + 'A2:A'], valueRenderOption: 'UNFORMATTED_VALUE',
+  }, requestOptions)
+  const headers = register.data.valueRanges?.[0]?.values?.[0] ?? []
+  if (JSON.stringify(headers.slice(0, expenseHeaders.length)) !== JSON.stringify(expenseHeaders)) {
+    throw new Error('The expense sheet header has changed')
+  }
+  const code = expenseCode(expense.id)
+  const matches = (register.data.valueRanges?.[1]?.values ?? []).flatMap(([id], index) => id === code ? [index + 1] : [])
+  if (matches.length > 1) throw new Error('The expense sheet has more than one row for this expense')
+  const rows = [{ values: [
+    textCell(code),
+    dateCell(expense.payment_date),
+    textCell(expense.description),
+    textCell(expense.vendor),
+    textCell(expense.currency),
+    amountCell(expense.amount),
+    textCell(expenseStatus(expense)),
+    linkedCell(expense.receipt_url ? [{ label: 'Open receipt', url: expense.receipt_url }] : []),
+    textCell(expense.receipt_number),
+    textCell(expense.payment_reference),
+    textCell(expense.linked_invoice_id ? invoiceCode(expense.linked_invoice_id) : null),
+    amountCell(expense.linked_invoice_id ? '0' : expense.amount),
+  ] }]
+  const rowIndex = matches[0]
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: { requests: [rowIndex === undefined
+      ? { appendCells: { sheetId, rows, fields: cellFields } }
+      : { updateCells: { start: { sheetId, rowIndex, columnIndex: 0 }, rows, fields: cellFields } }] },
+  }, requestOptions)
 }

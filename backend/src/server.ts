@@ -1,4 +1,5 @@
 import { startSheetSyncWorker } from './services/sheetSyncWorker.js'
+import { expenseStorageReady, startExpenseSyncWorker } from './services/expenseSyncWorker.js'
 
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -13,6 +14,7 @@ import pool from './db/postgres.js'
 
 import postgresUploadRouter from './routes/postgresUpload.js'
 import postgresInvoicesRouter from './routes/postgresInvoices.js'
+import expensesRouter from './routes/expenses.js'
 
 import googleAuthRouter from './routes/googleAuth.js'
 import userAuthRouter from './routes/userAuth.js'
@@ -119,6 +121,7 @@ app.get('/api/health', (_req, res) => {
     status: 'ok',
     service: 'AI Invoice Manager API',
     invoiceWorkflowReady,
+    expenseStorageReady: expenseStorageReady(),
   })
 })
 
@@ -156,6 +159,8 @@ app.use(
 // -----------------------------------------
 // 9. Protected invoice dashboard APIs
 // -----------------------------------------
+
+app.use('/api/expenses', requireAuth, requireInvoiceWorkflow, expensesRouter)
 
 app.use(
   '/api',
@@ -231,12 +236,13 @@ app.use(
 function startInvoiceWorkflowWhenReady() {
   const check = async () => {
     const { rows } = await pool.query<{ ready: boolean }>(
-      "SELECT to_regclass('public.invoice_register') IS NOT NULL AS ready",
+      "SELECT to_regclass('public.invoice_register') IS NOT NULL AND to_regclass('public.standalone_expenses') IS NOT NULL AS ready",
     )
     if (!invoiceWorkflowReady && rows[0]?.ready) {
       invoiceWorkflowReady = true
       clearInterval(timer)
       startSheetSyncWorker()
+      startExpenseSyncWorker()
     }
   }
   const retry = () => { void check().catch(() => console.error('Could not check the invoice schema')) }
