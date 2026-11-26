@@ -33,7 +33,11 @@ async function prepareDestination(spreadsheetId: string) {
     if (!lock?.locked) return undefined
     const folderId = await expenseFolder()
     const sheetId = await ensureExpenseSheet(spreadsheetId)
-    await ensureExpenseSheetShortcut(folderId, spreadsheetId)
+    try {
+      await ensureExpenseSheetShortcut(folderId, spreadsheetId)
+    } catch (error) {
+      console.warn('Expense register shortcut setup:', googleErrorCode(error))
+    }
     return { folderId, sheetId, spreadsheetId }
   })
 }
