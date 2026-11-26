@@ -395,7 +395,6 @@ Follow these rules:
           type: 'json_schema',
           json_schema: { name: 'invoice', strict: true, schema: invoiceSchema },
         },
-        temperature: 0,
       }),
     })
 
