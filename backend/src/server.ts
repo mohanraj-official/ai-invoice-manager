@@ -13,7 +13,6 @@ import pool from './db/postgres.js'
 
 import postgresUploadRouter from './routes/postgresUpload.js'
 import postgresInvoicesRouter from './routes/postgresInvoices.js'
-import paymentReconciliationRouter from './routes/paymentReconciliation.js'
 
 import googleAuthRouter from './routes/googleAuth.js'
 import userAuthRouter from './routes/userAuth.js'
@@ -26,6 +25,15 @@ import { requireAdmin } from './middleware/requireAdmin.js'
 // -----------------------------------------
 
 const app = express()
+let invoiceWorkflowReady = false
+
+const requireInvoiceWorkflow: express.RequestHandler = (_req, res, next) => {
+  if (invoiceWorkflowReady) {
+    next()
+    return
+  }
+  res.status(503).json({ error: 'The invoice tracker is temporarily unavailable while its database is being prepared.' })
+}
 
 const PORT = Number(process.env.PORT) || 3001
 const isProduction = process.env.NODE_ENV === 'production'
@@ -110,6 +118,7 @@ app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'AI Invoice Manager API',
+    invoiceWorkflowReady,
   })
 })
 
@@ -140,6 +149,7 @@ app.use(
 app.use(
   '/api/upload',
   requireAuth,
+  requireInvoiceWorkflow,
   postgresUploadRouter
 )
 
@@ -150,8 +160,8 @@ app.use(
 app.use(
   '/api',
   requireAuth,
-  postgresInvoicesRouter,
-  paymentReconciliationRouter
+  requireInvoiceWorkflow,
+  postgresInvoicesRouter
 )
 
 
@@ -218,12 +228,21 @@ app.use(
 // 11. Start backend server
 // -----------------------------------------
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Backend running on port ${PORT}`)
-  startSheetSyncWorker()
-})
-
-
+function startInvoiceWorkflowWhenReady() {
+  const check = async () => {
+    const { rows } = await pool.query<{ ready: boolean }>(
+      "SELECT to_regclass('public.invoice_register') IS NOT NULL AS ready",
+    )
+    if (!invoiceWorkflowReady && rows[0]?.ready) {
+      invoiceWorkflowReady = true
+      clearInterval(timer)
+      startSheetSyncWorker()
+    }
+  }
+  const retry = () => { void check().catch(() => console.error('Could not check the invoice schema')) }
+  const timer = setInterval(retry, 5000).unref()
+  retry()
+}
 
 async function startServer() {
   try {
@@ -231,6 +250,7 @@ async function startServer() {
 
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`Backend running on port ${PORT}`)
+      startInvoiceWorkflowWhenReady()
     })
   } catch (error) {
     console.error(

@@ -17,7 +17,7 @@ if (!googleClientId) {
   throw new Error('VITE_GOOGLE_CLIENT_ID is missing')
 }
 
-function AuthGate() {
+export function AuthGate() {
   const [user, setUser] = useState<User | null>(null)
   const [checking, setChecking] = useState(true)
 
@@ -81,31 +81,7 @@ function AuthGate() {
     return <LoginScreen onLogin={setUser} />
   }
 
-  return (
-    <>
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'flex-end',
-          alignItems: 'center',
-          gap: '16px',
-          padding: '12px 24px',
-          background: '#ffffff',
-        }}
-      >
-        <span>{user.name} ({user.email})</span>
-
-        <button
-          type="button"
-          onClick={() => void handleLogout()}
-        >
-          Logout
-        </button>
-      </div>
-
-      <App />
-    </>
-  )
+  return <App user={user} onLogout={() => void handleLogout()} />
 }
 
 ReactDOM.createRoot(

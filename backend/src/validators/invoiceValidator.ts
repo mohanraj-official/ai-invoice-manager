@@ -21,6 +21,15 @@ const lineItemSchema = z.object({
 
 export const extractedInvoiceSchema = z.object({
   document_type: z.enum(['invoice', 'receipt', 'unknown']).default('unknown'),
+  receipt_details: z.object({
+    invoice_reference: nullableString,
+    transaction_reference: nullableString,
+    payment_date: nullableString,
+    amount_paid: nullableNumber,
+    payer_name: nullableString,
+    method: z.enum(['bank', 'card', 'upi', 'cash', 'other']),
+    status: z.enum(['successful', 'pending', 'failed', 'unknown']),
+  }).strict().nullable().default(null),
   invoice_number: nullableString,
   invoice_date: nullableString,
   due_date: nullableString,

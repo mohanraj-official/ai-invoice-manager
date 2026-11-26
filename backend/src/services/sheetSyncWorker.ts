@@ -1,176 +1,138 @@
 import pool from '../db/postgres.js'
+import { googleOAuthClient } from './googleAuth.js'
+import { googleErrorCode, invoiceYearFolder, reserveDriveId, saveInvoiceFile } from './googleDrive.js'
+import { getInvoice, getPayments, queueSheet, transaction } from './invoiceRecords.js'
+import { documentFilename, invoiceCode } from './invoiceWorkflow.js'
 import { saveInvoiceToSheet } from './googleSheets.js'
-import type { ExtractedInvoice } from '../types/invoice.js'
 
-const RETRY_INTERVAL_MS = 5 * 60 * 1000
-const BATCH_SIZE = 10
+const batchSize = 10
+let running: Promise<void> | undefined
 
-let isRunning = false
-
-type PendingInvoice = {
-  id: string
-  drive_file_id: string
-  drive_file_url: string
-  financial_check_status: string
-  document_type: ExtractedInvoice['document_type']
-  invoice_number: string | null
-  invoice_date: string | null
-  due_date: string | null
-  vendor_name: string | null
-  vendor_tax_id: string | null
-  vendor_address: string | null
-  customer_name: string | null
-  customer_tax_id: string | null
-  customer_address: string | null
-  currency: string | null
-  subtotal: number | string | null
-  discount_total: number | string | null
-  tax_total: number | string | null
-  cgst: number | string | null
-  sgst: number | string | null
-  igst: number | string | null
-  total: number | string | null
-  payment_status: ExtractedInvoice['payment_status']
-  category: string | null
-  billing_period_start: string | null
-  billing_period_end: string | null
+type DriveWork = {
+  document_id: string
+  target_invoice_id: string | null
+  payment_id: string | null
+  receipt_number: number | null
+  content: Buffer
 }
 
-function amount(value: number | string | null): number | null {
-  return value === null ? null : Number(value)
+async function nextDocument(): Promise<DriveWork | undefined> {
+  const { rows } = await pool.query<DriveWork>(`
+    UPDATE invoice_work_files SET available_at = NOW() + INTERVAL '5 minutes'
+    WHERE document_id = (
+      SELECT document_id FROM invoice_work_files WHERE state = 'ready' AND available_at <= NOW()
+      ORDER BY available_at, document_id LIMIT 1 FOR UPDATE SKIP LOCKED
+    )
+    RETURNING document_id, target_invoice_id, payment_id, receipt_number, content
+  `)
+  return rows[0]
 }
 
-function rebuildInvoice(row: PendingInvoice): ExtractedInvoice {
-  return {
-    document_type: row.document_type ?? 'unknown',
-    invoice_number: row.invoice_number,
-    invoice_date: row.invoice_date,
-    due_date: row.due_date,
-
-    vendor: {
-      name: row.vendor_name,
-      tax_id: row.vendor_tax_id,
-      address: row.vendor_address,
-    },
-
-    customer: {
-      name: row.customer_name,
-      tax_id: row.customer_tax_id,
-      address: row.customer_address,
-    },
-
-    currency: row.currency,
-    subtotal: amount(row.subtotal),
-    discount_total: amount(row.discount_total),
-    tax_total: amount(row.tax_total),
-
-    cgst: amount(row.cgst),
-    sgst: amount(row.sgst),
-    igst: amount(row.igst),
-    total: amount(row.total),
-
-    payment_status: row.payment_status,
-    category: row.category,
-    billing_period_start: row.billing_period_start,
-    billing_period_end: row.billing_period_end,
-
-    line_items: [],
+async function writeDocument(work: DriveWork) {
+  const invoiceId = work.target_invoice_id ?? work.document_id
+  const invoice = await getInvoice(invoiceId)
+  if (!invoice?.vendor_name || !invoice.invoice_date) throw new Error('Invoice folder details are missing')
+  const { rows: [document] } = await pool.query<{ mime_type: string; drive_upload_id: string | null }>(
+    'SELECT mime_type, drive_upload_id FROM invoices WHERE id = $1', [work.document_id],
+  )
+  if (!document) return
+  let fileId = document.drive_upload_id
+  if (!fileId) {
+    const { rows: [reserved] } = await pool.query<{ drive_upload_id: string }>(`
+      UPDATE invoices SET drive_upload_id = COALESCE(drive_upload_id, $2)
+      WHERE id = $1 RETURNING drive_upload_id
+    `, [work.document_id, await reserveDriveId()])
+    if (!reserved) return
+    fileId = reserved.drive_upload_id
   }
+
+  const parentId = await invoiceYearFolder(invoice.vendor_name, invoice.invoice_date.slice(0, 4))
+  const filename = documentFilename(
+    invoiceId, invoice.invoice_date, document.mime_type, work.receipt_number ?? undefined,
+  )
+  const url = await saveInvoiceFile({
+    fileId, parentId, filename, mimeType: document.mime_type,
+    content: work.content, invoiceId: invoiceCode(invoiceId), documentId: work.document_id,
+  })
+
+  await transaction(async (client) => {
+    const { rowCount } = await client.query(
+      'DELETE FROM invoice_work_files WHERE document_id = $1 AND state = $2', [work.document_id, 'ready'],
+    )
+    if (!rowCount) return
+    await client.query(`
+      UPDATE invoices SET drive_file_url = $2, drive_file_id = $3, drive_status = 'uploaded'
+      WHERE id = $1
+    `, [work.document_id, url, fileId])
+    if (work.payment_id) {
+      await client.query(`
+        UPDATE invoice_payments SET verified_by = recorded_by, verified_at = NOW()
+        WHERE id = $1 AND verified_at IS NULL
+      `, [work.payment_id])
+    }
+    await queueSheet(invoiceId, client)
+  })
 }
 
-async function retrySheetSync(): Promise<void> {
-  if (isRunning) return
+async function syncNextSheetRow(): Promise<boolean> {
+  return transaction(async (client) => {
+    const scope = [process.env.GOOGLE_SHEET_ID ?? '', process.env.GOOGLE_SHEET_TAB ?? 'INVOICES'].join(':')
+    const { rows: [lock] } = await client.query<{ locked: boolean }>(
+      'SELECT pg_try_advisory_xact_lock(hashtext($1)) AS locked', ['invoice-sheet:' + scope],
+    )
+    if (!lock?.locked) return false
 
-  isRunning = true
+    const { rows: [job] } = await client.query<{ invoice_id: string }>(`
+      SELECT q.invoice_id FROM invoice_sheet_queue q JOIN invoices i ON i.id = q.invoice_id
+      WHERE q.available_at <= NOW() AND i.drive_status = 'uploaded'
+      ORDER BY q.available_at, q.invoice_id LIMIT 1 FOR UPDATE OF q SKIP LOCKED
+    `)
+    if (!job) return false
 
-  try {
-    const result = await pool.query<PendingInvoice>(`
-      SELECT
-        i.id,
-        i.drive_file_id,
-        i.drive_file_url,
-        e.financial_check_status,
-        e.document_type,
-        e.invoice_number,
-        e.invoice_date,
-        e.due_date,
-        e.vendor_name,
-        e.vendor_tax_id,
-        e.vendor_address,
-        e.customer_name,
-        e.customer_tax_id,
-        e.customer_address,
-        e.currency,
-        e.subtotal,
-        e.discount_total,
-        e.tax_total,
-        e.cgst,
-        e.sgst,
-        e.igst,
-        e.total,
-        e.payment_status,
-        e.category,
-        e.billing_period_start,
-        e.billing_period_end
-      FROM invoices i
-      JOIN invoice_extractions e
-        ON e.invoice_id = i.id
-      WHERE i.sheet_sync_status <> 'synced'
-        AND i.drive_status = 'uploaded'
-        AND i.drive_file_id IS NOT NULL
-        AND i.drive_file_url IS NOT NULL
-      ORDER BY i.id
-      LIMIT $1
-    `, [BATCH_SIZE])
-
-    for (const row of result.rows) {
-      const invoiceId = Number(row.id)
-
+    const invoice = await getInvoice(job.invoice_id, client)
+    if (invoice) {
       try {
-        await saveInvoiceToSheet(
-          invoiceId,
-          rebuildInvoice(row),
-          row.financial_check_status,
-          row.drive_file_id,
-          row.drive_file_url
-        )
-
-        await pool.query(`
-          UPDATE invoices
-          SET
-            sheet_sync_status = 'synced',
-            sheet_synced_at = NOW()
-          WHERE id = $1
-        `, [invoiceId])
-
-        console.log(`Invoice ${invoiceId} synced to Sheets`)
+        await saveInvoiceToSheet(invoice, await getPayments(invoice.id, client))
       } catch (error) {
-        await pool.query(`
-          UPDATE invoices
-          SET sheet_sync_status = 'failed'
-          WHERE id = $1
-        `, [invoiceId]).catch(console.error)
-
-        console.error(
-          `Sheets retry failed for invoice ${invoiceId}:`,
-          error
-        )
+        await client.query(`
+          UPDATE invoice_sheet_queue SET available_at = NOW() + INTERVAL '1 minute' WHERE invoice_id = $1
+        `, [job.invoice_id])
+        console.warn('Invoice sheet sync will retry:', job.invoice_id, googleErrorCode(error))
+        return true
       }
     }
-  } catch (error) {
-    console.error('Google Sheets retry worker failed:', error)
-  } finally {
-    isRunning = false
+    await client.query('DELETE FROM invoice_sheet_queue WHERE invoice_id = $1', [job.invoice_id])
+    return true
+  })
+}
+
+async function runWorker() {
+  if (!googleOAuthClient.credentials.refresh_token && !googleOAuthClient.credentials.access_token) return
+  for (let count = 0; count < batchSize; count++) {
+    const work = await nextDocument()
+    if (!work) break
+    try {
+      await writeDocument(work)
+    } catch (error) {
+      await pool.query(`
+        UPDATE invoice_work_files SET available_at = NOW() + INTERVAL '1 minute' WHERE document_id = $1
+      `, [work.document_id])
+      console.warn('Invoice file sync will retry:', work.document_id, googleErrorCode(error))
+    }
   }
+  for (let count = 0; count < batchSize; count++) {
+    if (!await syncNextSheetRow()) break
+  }
+}
+
+export function runInvoiceSync(): Promise<void> {
+  running ??= runWorker()
+    .catch((error: unknown) => { console.error('Invoice sync worker:', googleErrorCode(error)) })
+    .finally(() => { running = undefined })
+  return running
 }
 
 export function startSheetSyncWorker(): void {
-  // Give Google authorization time to restore.
-  setTimeout(() => {
-    void retrySheetSync()
-
-    setInterval(() => {
-      void retrySheetSync()
-    }, RETRY_INTERVAL_MS)
-  }, 30_000)
+  void runInvoiceSync()
+  setInterval(() => { void runInvoiceSync() }, 15_000).unref()
 }

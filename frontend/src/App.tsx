@@ -1,513 +1,514 @@
-
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import './App.css'
-import Payments, { formatPaymentAmount } from './Payments'
 
-type ApiStatus = 'checking' | 'connected' | 'disconnected'
-
-type ExtractionStatus =
-  | 'completed'
-  | 'failed'
-  | 'not_processed'
-
-type UploadedFile = {
-  filename: string
-  size: number
-  mimeType: string
-  sha256: string
-  duplicate: boolean
-  invoiceId: number
-  extractionStatus: ExtractionStatus
-}
-
-
-type InvoiceHistoryItem = {
-  id: number
-  filename: string
-  mimeType: string
-  fileSize: number
-  uploadedAt: string
-  documentType: 'invoice' | 'receipt' | 'unknown' | null
+type Invoice = {
+  id: string
+  invoiceId: string
   invoiceNumber: string | null
   invoiceDate: string | null
   dueDate: string | null
-  vendorName: string | null
+  vendor: string | null
   currency: string | null
-  total: number | null
-  confirmedPaid: string
-  reportedPaid: string
-  hasReceipt: boolean
-  paymentStatus: string | null
-  financialStatus: string | null
-  extractedAt: string | null
-  driveFileUrl: string | null
-  driveStatus: string | null
+  total: string | null
+  invoiceUrl: string | null
+  description: string | null
+  category: string | null
+  amountPaid: string
+  balanceDue: string | null
+  overpayment: string | null
+  paymentDate: string | null
+  paymentStatus: 'unpaid' | 'partially_paid' | 'paid' | 'overpaid'
+  syncPending: boolean
 }
 
-
-type DashboardStats = {
-  success: boolean
-  balances: { currency: string; billed: string; paid: string }[]
+type Payment = {
+  id: string
+  date: string
+  amount: string
+  currency: string
+  paidBy: string | null
+  reference: string | null
+  receipts: { url: string }[]
 }
 
-type UploadResponse = {
-  success: boolean
-  count: number
-  files: UploadedFile[]
-  error?: string
+type ReceiptReview = {
+  id: string
+  filename: string
+  targetInvoiceId: string | null
+  proof: {
+    vendorName: string | null
+    invoiceReference: string | null
+    transactionReference: string | null
+    amount: string
+    currency: string
+    paymentDate: string
+    successful: boolean
+  }
 }
 
-const MAX_FILES = 10
-const MAX_FILE_SIZE = 10 * 1024 * 1024
+type Dashboard = {
+  invoices: Invoice[]
+  reviews: ReceiptReview[]
+  googleConnected: boolean
+  canConnectGoogle: boolean
+}
 
-function App() {
+type UploadResult = {
+  kind: 'invoice' | 'receipt' | 'duplicate' | 'review'
+  invoiceId: string | null
+  reviewId?: string
+}
 
-  const [invoiceHistory, setInvoiceHistory] = useState<InvoiceHistoryItem[]>([])
+const months = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+]
+const labels = {
+  unpaid: 'Unpaid',
+  partially_paid: 'Partially paid',
+  paid: 'Paid',
+  overpaid: 'Paid · Overpaid',
+}
+const fileTypes = 'application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png'
+const pageSize = 5
 
-  const [historyError, setHistoryError] = useState('')
+function formatMoney(amount: string | null, currency: string | null) {
+  if (amount === null || !currency) return '—'
+  return new Intl.NumberFormat('en-IN', { style: 'currency', currency }).format(Number(amount))
+}
 
-  const [apiStatus, setApiStatus] = useState<ApiStatus>('checking')
+function formatDate(value: string | null) {
+  if (!value) return '—'
+  const date = new Date(value + 'T00:00:00Z')
+  return Number.isNaN(date.valueOf()) ? value : new Intl.DateTimeFormat('en-IN', {
+    day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC',
+  }).format(date)
+}
 
-  const [balances, setBalances] = useState<DashboardStats['balances']>([])
-  const [paymentInvoice, setPaymentInvoice] = useState<InvoiceHistoryItem | null>(null)
-  const [overdueOnly, setOverdueOnly] = useState(false)
-  const [view, setView] = useState<'invoice' | 'receipt' | 'payments' | 'review'>('invoice')
-  const [showUpload, setShowUpload] = useState(false)
-  const [summaryChoice, setSummaryChoice] = useState('')
-  const [currencyFilter, setCurrencyFilter] = useState('all')
-  const [search, setSearch] = useState('')
-  const [dragging, setDragging] = useState(false)
-
-
-  const [files, setFiles] = useState<File[]>([])
-  const [uploading, setUploading] = useState(false)
-  const [message, setMessage] = useState('')
-  const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([])
-
-  const fileInputRef = useRef<HTMLInputElement>(null)
-
-  function updateStats(stats: DashboardStats) {
-    if (!stats.success) {
-      throw new Error('Statistics API returned an error')
-    }
-
-    setBalances(stats.balances ?? [])
+function totalByCurrency(invoices: Invoice[]) {
+  const amounts = new Map<string, bigint>()
+  for (const { currency, total } of invoices) {
+    if (!currency || total === null) continue
+    const [units, cents = ''] = total.replace(/^-/, '').split('.')
+    const unsigned = BigInt(units) * 100n + BigInt(cents.padEnd(2, '0'))
+    const amount = total.startsWith('-') ? -unsigned : unsigned
+    amounts.set(currency, (amounts.get(currency) ?? 0n) + amount)
   }
-
-  async function loadStats(signal?: AbortSignal) {
-    const response = await fetch('/api/stats', { signal })
-
-    if (!response.ok) {
-      throw new Error('Failed to load statistics')
-    }
-
-    const stats: DashboardStats = await response.json()
-
-    if (!signal?.aborted) {
-      updateStats(stats)
-    }
-  }
-
-  useEffect(() => {
-    const controller = new AbortController()
-
-    async function checkBackend() {
-      try {
-        const response = await fetch('/api/health', {
-          signal: controller.signal,
-        })
-
-        if (!response.ok) {
-          throw new Error('Backend unavailable')
-        }
-
-        const data: { status: string } = await response.json()
-
-        if (!controller.signal.aborted) {
-          setApiStatus(
-            data.status === 'ok' ? 'connected' : 'disconnected'
-          )
-        }
-      } catch {
-        if (!controller.signal.aborted) {
-          setApiStatus('disconnected')
-        }
-      }
-    }
-
-    void checkBackend()
-
-    return () => controller.abort()
-  }, [])
-
-
-  useEffect(() => {
-    const controller = new AbortController()
-
-    void loadInvoiceHistory(controller.signal).catch((error) => {
-      if (!controller.signal.aborted) {
-        setHistoryError(
-          error instanceof Error
-            ? error.message
-            : 'Unable to load invoices'
-        )
-      }
-    })
-
-    return () => controller.abort()
-  }, [])
-
-
-  useEffect(() => {
-    const controller = new AbortController()
-
-    void loadStats(controller.signal).catch((error) => {
-      if (!controller.signal.aborted) {
-        console.error('Statistics request failed:', error)
-      }
-    })
-
-    return () => controller.abort()
-  }, [])
-
-  function handleFileSelection(
-    event: React.ChangeEvent<HTMLInputElement>
-  ) {
-    selectFiles(Array.from(event.target.files ?? []))
-    event.target.value = ''
-  }
-
-  function selectFiles(selectedFiles: File[]) {
-    if (uploading || selectedFiles.length === 0) return
-
-    setMessage('')
-
-    if (selectedFiles.length > MAX_FILES) {
-      setFiles([])
-      setMessage('You can upload a maximum of 10 files.')
-      return
-    }
-
-    const oversizedFile = selectedFiles.find(
-      (file) => file.size > MAX_FILE_SIZE
-    )
-
-    if (oversizedFile) {
-      setFiles([])
-      setMessage(
-        `${oversizedFile.name} exceeds the 10 MB file limit.`
-      )
-      return
-    }
-
-    const invalidFile = selectedFiles.find((file) => !/\.(pdf|jpe?g|png)$/i.test(file.name))
-    if (invalidFile) {
-      setMessage(`${invalidFile.name} must be a PDF, JPG, or PNG.`)
-      return
-    }
-
-    setFiles(selectedFiles)
-  }
-
-  async function loadInvoiceHistory(signal?: AbortSignal) {
-    const response = await fetch('/api/invoices', { signal })
-
-    if (!response.ok) {
-      throw new Error('Failed to load invoice history')
-    }
-
-    const data: {
-      success: boolean
-      invoices: InvoiceHistoryItem[]
-    } = await response.json()
-
-    if (!data.success) {
-      throw new Error('Invoice history API returned an error')
-    }
-
-    if (!signal?.aborted) {
-      setInvoiceHistory(data.invoices)
-      setHistoryError('')
-    }
-  }
-
-
-  async function handleUpload() {
-    if (files.length === 0 || uploading) return
-
-    setUploading(true)
-    setMessage('')
-    setUploadedFiles([])
-
-    try {
-      const formData = new FormData()
-
-      files.forEach((file) => {
-        formData.append('files', file)
-      })
-
-      const response = await fetch('/api/upload', {
-        method: 'POST',
-        body: formData,
-      })
-
-      const data: UploadResponse = await response.json()
-
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || 'Upload failed')
-      }
-
-      setUploadedFiles(data.files)
-
-      const completed = data.files.filter(
-        (file) => file.extractionStatus === 'completed'
-      ).length
-
-      const failed = data.files.filter(
-        (file) => file.extractionStatus === 'failed'
-      ).length
-
-      const duplicates = data.files.filter(
-        (file) => file.duplicate
-      ).length
-
-      setMessage(
-        `${data.count} file(s) processed. ` +
-        `${completed} AI extraction(s) completed, ` +
-        `${failed} failed, ` +
-        `${duplicates} duplicate(s).`
-      )
-
-      setFiles([])
-
-      if (fileInputRef.current) {
-        fileInputRef.current.value = ''
-      }
-
-      try {
-        await loadStats()
-      } catch (statsError) {
-        console.error('Statistics refresh failed:', statsError)
-        setMessage((previous) =>
-          `${previous} Dashboard statistics could not be refreshed.`
-        )
-      }
-
-      try {
-        await loadInvoiceHistory()
-      } catch (error) {
-        console.error('Invoice history refresh failed:', error)
-      }
-    } catch (error) {
-      setMessage(
-        error instanceof Error
-          ? error.message
-          : 'Upload failed'
-      )
-    } finally {
-      setUploading(false)
-    }
-  }
-
-  function renderExtractionStatus(status: ExtractionStatus) {
-    switch (status) {
-      case 'completed':
-        return (
-          <span style={{ color: '#16a34a' }}>
-            AI extraction completed
-          </span>
-        )
-
-      case 'failed':
-        return (
-          <span style={{ color: '#dc2626' }}>
-            AI extraction failed
-          </span>
-        )
-
-      case 'not_processed':
-        return (
-          <span style={{ color: '#d97706' }}>
-            AI extraction not processed
-          </span>
-        )
-    }
-  }
-
-  const today = new Date().toLocaleDateString('sv-SE')
-  const query = search.trim().toLowerCase()
-  const currencies = [...new Set([
-    ...balances.map((entry) => entry.currency),
-    ...invoiceHistory.flatMap((entry) => entry.currency ? [entry.currency] : []),
-  ])].sort()
-  const summaryCurrency = balances.some((entry) => entry.currency === summaryChoice) ? summaryChoice : balances[0]?.currency
-  const summary = balances.find((entry) => entry.currency === summaryCurrency)
-  const needsReview = (entry: InvoiceHistoryItem) =>
-    !entry.documentType || entry.documentType === 'unknown' || !entry.currency ||
-    entry.financialStatus === 'mismatch' || Number(entry.reportedPaid) > 0 ||
-    (entry.documentType === 'invoice' && entry.paymentStatus === 'paid' && Number(entry.confirmedPaid) === 0)
-  const reviewCount = invoiceHistory.filter(needsReview).length
-  const visibleDocuments = invoiceHistory.filter((entry) => {
-    const matchesView = view === 'review' ? needsReview(entry) : entry.documentType === view
-    return matchesView &&
-      (currencyFilter === 'all' || entry.currency === currencyFilter) &&
-      (!overdueOnly || Boolean(entry.documentType === 'invoice' && entry.dueDate &&
-        entry.dueDate < today && entry.total !== null && Math.round(entry.total * 100) > Math.round(Number(entry.confirmedPaid) * 100))) &&
-      (!query || [entry.filename, entry.invoiceNumber, entry.vendorName].some((value) => value?.toLowerCase().includes(query)))
+  return [...amounts].sort(([left], [right]) => left.localeCompare(right)).map(([currency, cents]) => {
+    const absolute = cents < 0n ? -cents : cents
+    const decimal = String(absolute / 100n) + '.' + String(absolute % 100n).padStart(2, '0')
+    return { currency, amount: cents < 0n ? '-' + decimal : decimal }
   })
+}
 
-  function openPayment(invoice: InvoiceHistoryItem) {
-    setPaymentInvoice({ ...invoice })
-    setView('payments')
+async function api<T>(path: string, options?: RequestInit): Promise<T> {
+  const response = await fetch(path, { credentials: 'include', ...options })
+  const result = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    throw new Error(result.error || (response.status === 401 ? 'Sign in again to continue.' : 'Try again. The request could not be completed.'))
   }
+  return result as T
+}
 
+function Chevron({ expanded }: { expanded: boolean }) {
+  return <span className={'chevron' + (expanded ? ' chevron-up' : '')} aria-hidden="true" />
+}
+
+function Modal({ title, busy, onClose, children }: {
+  title: string; busy: boolean; onClose: () => void; children: ReactNode
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  useEffect(() => {
+    const dialog = ref.current
+    dialog?.showModal()
+    return () => dialog?.close()
+  }, [])
   return (
-    <main className="app">
-      <header className="header">
-        <h1>AI Invoice Manager</h1>
-        <button className="primary-button" type="button" aria-expanded={showUpload} aria-controls="upload-panel"
-          onClick={() => setShowUpload((open) => !open)}>
-          {showUpload ? 'Close upload' : 'Upload documents'}
-        </button>
-      </header>
-
-      {apiStatus === 'disconnected' && <p role="alert">The backend is unavailable. Try refreshing in a moment.</p>}
-
-      <section className="dashboard-summary" aria-label="Invoice balances">
-        <div className="summary-heading">
-          <h2>Invoice balances</h2>
-          {balances.length > 1 && <label>Currency
-            <select value={summaryCurrency} onChange={(event) => setSummaryChoice(event.target.value)}>
-              {balances.map((entry) => entry.currency).map((currency) => <option key={currency}>{currency}</option>)}
-            </select>
-          </label>}
-        </div>
-        <div className="stats">
-          {([
-            ['Billed', Number(summary?.billed)],
-            ['Confirmed paid', Number(summary?.paid)],
-            ['Outstanding', Number(summary?.billed) - Number(summary?.paid)],
-          ] as const).map(([label, amount]) => (
-            <div className="stat-card" key={label}>
-              <h3>{label}</h3>
-              <strong>{summary && summaryCurrency ? formatPaymentAmount(amount, summaryCurrency) : '—'}</strong>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section id="upload-panel" className="upload-card" hidden={!showUpload}>
-        <h2>Upload invoices or receipts</h2>
-        <div className={dragging ? 'drop-zone drop-zone-active' : 'drop-zone'}
-          onDragOver={(event) => { event.preventDefault(); if (!uploading) setDragging(true) }}
-          onDragLeave={(event) => {
-            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false)
-          }}
-          onDrop={(event) => {
-            event.preventDefault()
-            setDragging(false)
-            selectFiles(Array.from(event.dataTransfer.files))
-          }}>
-          <p>Drop up to 10 PDF, JPG, or PNG files here. Maximum 10 MB each.</p>
-          <button type="button" disabled={uploading} onClick={() => fileInputRef.current?.click()}>Browse files</button>
-        </div>
-        <input hidden ref={fileInputRef} type="file" accept=".pdf,.jpg,.jpeg,.png" multiple
-          disabled={uploading} onChange={handleFileSelection} />
-        {files.length > 0 && <ul className="selected-files">
-          {files.map((file, index) => <li key={`${file.name}-${index}`}>
-            <span>{file.name}</span>
-            <button type="button" disabled={uploading} aria-label={`Remove ${file.name}`}
-              onClick={() => setFiles((current) => current.filter((_, position) => position !== index))}>Remove</button>
-          </li>)}
-        </ul>}
-        <button className="upload-action" type="button" disabled={!files.length || uploading} onClick={() => void handleUpload()}>
-          {uploading ? 'Processing…' : 'Upload files'}
-        </button>
-        {message && <p role="status">{message}</p>}
-        {uploadedFiles.length > 0 && <details className="upload-results">
-          <summary>File results</summary>
-          <ul>{uploadedFiles.map((file, index) => <li key={`${file.sha256}-${index}`}>
-            {file.filename} · {file.duplicate ? 'Existing file' : 'New file'} · {renderExtractionStatus(file.extractionStatus)}
-          </li>)}</ul>
-        </details>}
-      </section>
-
-      <nav className="dashboard-nav" aria-label="Dashboard views">
-        {([
-          ['invoice', 'Invoices'], ['receipt', 'Receipts'], ['payments', 'Payments'], ['review', 'Needs review'],
-        ] as const).map(([key, label]) => (
-          <button type="button" key={key} aria-current={view === key ? 'page' : undefined} onClick={() => setView(key)}>
-            {label}{key === 'review' && reviewCount > 0 ? ` (${reviewCount})` : ''}
-          </button>
-        ))}
-      </nav>
-
-      <div hidden={view !== 'payments'}>
-        <Payments documents={invoiceHistory} invoice={paymentInvoice}
-          onCloseInvoice={() => setPaymentInvoice(null)}
-          onSaved={() => Promise.all([loadStats(), loadInvoiceHistory()])} />
+    <dialog ref={ref} className="invoice-dialog" aria-label={title} onCancel={(event) => {
+      event.preventDefault()
+      if (!busy) onClose()
+    }}>
+      <div className="dialog-heading">
+        <h2>{title}</h2>
+        <button className="icon-button" type="button" aria-label="Close" disabled={busy} onClick={onClose}>×</button>
       </div>
-
-      {view !== 'payments' && <section className="upload-card document-panel">
-        <div className="document-filters">
-          <label className="document-search">Search<input type="search" placeholder="Vendor, reference, or filename"
-            value={search} onChange={(event) => setSearch(event.target.value)} /></label>
-          <label>Currency<select value={currencyFilter} onChange={(event) => setCurrencyFilter(event.target.value)}>
-            <option value="all">All currencies</option>
-            {currencies.map((currency) => <option key={currency}>{currency}</option>)}
-          </select></label>
-          {view === 'invoice' && <label className="overdue-filter"><input type="checkbox" checked={overdueOnly}
-            onChange={(event) => setOverdueOnly(event.target.checked)} /> Overdue only</label>}
-        </div>
-        {historyError && <p role="alert">{historyError}</p>}
-        {!visibleDocuments.length && !historyError && <p>No matching documents.</p>}
-        <div className="document-list">
-          {visibleDocuments.map((entry) => {
-            const paid = Number(entry.confirmedPaid ?? 0)
-            const billed = entry.total
-            const payable = entry.documentType === 'invoice' && Boolean(entry.currency) && billed !== null
-            const outstanding = payable ? Math.round((billed - paid) * 100) / 100 : null
-            const reported = Number(entry.reportedPaid ?? 0)
-            const status = outstanding === null ? (entry.documentType === 'receipt' ? 'Receipt' : 'Needs review') :
-              outstanding <= 0 ? 'Paid' : reported > 0 || (entry.paymentStatus === 'paid' && paid === 0) ? 'Payment unverified' :
-              paid > 0 ? 'Partially paid' : 'Open'
-            const display = (value: number | null) => value === null ? '—' :
-              entry.currency ? formatPaymentAmount(value, entry.currency) : `${value.toFixed(2)} · Currency unknown`
-
-            return <article className="document-entry" key={entry.id}>
-              <div className="document-row">
-                <div className="document-identity">
-                  <strong>{entry.vendorName ?? entry.filename}</strong>
-                  <span>{entry.invoiceNumber ?? (entry.vendorName ? entry.filename : 'Reference unavailable')}</span>
-                </div>
-                <div className="document-amount"><strong>{display(outstanding ?? billed)}</strong>
-                  <span>{outstanding !== null ? 'Outstanding' : 'Document amount'}</span></div>
-                <span className={status === 'Paid' ? 'document-status paid-status' : 'document-status'}>{status}</span>
-                {outstanding !== null && outstanding > 0 && <button type="button" className="secondary-button"
-                  onClick={() => openPayment(entry)}>Upload receipt</button>}
-              </div>
-              <details className="document-details">
-                <summary>Details</summary>
-                <dl>
-                  <div><dt>Document date</dt><dd>{entry.invoiceDate ?? '—'}</dd></div>
-                  {payable && <>
-                    <div><dt>Due date</dt><dd>{entry.dueDate ?? '—'}</dd></div>
-                    <div><dt>Billed</dt><dd>{display(billed)}</dd></div>
-                    <div><dt>Confirmed paid</dt><dd>{display(paid)}</dd></div>
-                    {reported > 0 && <div><dt>Reported paid</dt><dd>{display(reported)}</dd></div>}
-                    {paid > 0 && <div><dt>Receipt</dt><dd>{entry.hasReceipt ? 'Attached' : 'Missing'}</dd></div>}
-                  </>}
-                  <div><dt>Extraction</dt><dd>{entry.extractedAt ? entry.financialStatus === 'mismatch' ? 'Totals need review' : 'Extracted' : 'Pending or failed'}</dd></div>
-                </dl>
-                {entry.driveStatus === 'uploaded' && entry.driveFileUrl && <a href={entry.driveFileUrl}
-                  target="_blank" rel="noopener noreferrer">Open original</a>}
-              </details>
-            </article>
-          })}
-        </div>
-      </section>}
-    </main>
+      {children}
+    </dialog>
   )
 }
 
-export default App
+function InvoiceDetails({ invoice, onReceipt }: { invoice: Invoice; onReceipt: () => void }) {
+  const [activity, setActivity] = useState<{ payments: Payment[]; error: string }>()
+  const { id, amountPaid, syncPending } = invoice
+  useEffect(() => {
+    const controller = new AbortController()
+    void api<{ payments: Payment[] }>('/api/invoices/' + id, { signal: controller.signal })
+      .then(({ payments }) => setActivity({ payments, error: '' }))
+      .catch((error: Error) => { if (!controller.signal.aborted) setActivity({ payments: [], error: error.message }) })
+    return () => controller.abort()
+  }, [id, amountPaid, syncPending])
+
+  return (
+    <div className="invoice-details" id={'details-' + id}>
+      {invoice.description && <p className="detail-description">{invoice.description}</p>}
+      <dl className="invoice-facts">
+        <div><dt>Invoice date</dt><dd>{formatDate(invoice.invoiceDate)}</dd></div>
+        <div><dt>Due date</dt><dd>{formatDate(invoice.dueDate)}</dd></div>
+        <div><dt>Amount paid</dt><dd>{formatMoney(invoice.amountPaid, invoice.currency)}</dd></div>
+        <div><dt>Balance due</dt><dd>{formatMoney(invoice.balanceDue, invoice.currency)}</dd></div>
+        {Number(invoice.overpayment) > 0 && <div><dt>Overpayment</dt><dd>{formatMoney(invoice.overpayment, invoice.currency)}</dd></div>}
+      </dl>
+      {activity?.error && <p className="inline-error" role="alert">{activity.error}</p>}
+      {!!activity?.payments.length && (
+        <ul className="payment-entries" aria-label="Verified payments">
+          {activity.payments.map((payment) => (
+            <li key={payment.id}>
+              <span><strong>{formatMoney(payment.amount, payment.currency)}</strong> · {formatDate(payment.date)}
+                {payment.paidBy && ' · ' + payment.paidBy}</span>
+              <div className="proof-links">
+                {payment.receipts.map((receipt, index) => <a key={receipt.url} href={receipt.url} target="_blank" rel="noreferrer">
+                  {payment.receipts.length === 1 ? 'Payment proof' : 'Proof ' + (index + 1)}
+                </a>)}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="detail-actions">
+        {invoice.invoiceUrl && <a className="button button-outline" href={invoice.invoiceUrl} target="_blank" rel="noreferrer">Open invoice ↗</a>}
+        <button className="button button-primary" type="button" onClick={onReceipt}>Upload receipt</button>
+      </div>
+    </div>
+  )
+}
+
+export default function App({ user, onLogout }: { user: { name: string }; onLogout: () => void }) {
+  const [dashboard, setDashboard] = useState<Dashboard>()
+  const [loadError, setLoadError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [uploadError, setUploadError] = useState('')
+  const [search, setSearch] = useState('')
+  const [vendor, setVendor] = useState('')
+  const [month, setMonth] = useState('')
+  const [year, setYear] = useState('')
+  const [awaiting, setAwaiting] = useState(false)
+  const [showAll, setShowAll] = useState(false)
+  const [expandedId, setExpandedId] = useState<string>()
+  const [busy, setBusy] = useState<'invoice' | 'receipt' | 'review'>()
+  const [receipt, setReceipt] = useState<{ invoice?: Invoice; file?: File }>()
+  const [payer, setPayer] = useState('')
+  const [review, setReview] = useState<{ id: string; invoiceId: string }>()
+  const [modalError, setModalError] = useState('')
+  const [dragged, setDragged] = useState<'invoice' | 'receipt'>()
+  const invoicePicker = useRef<HTMLInputElement>(null)
+  const requestId = useRef(0)
+
+  const load = useCallback(async (signal?: AbortSignal) => {
+    const id = ++requestId.current
+    try {
+      const next = await api<Dashboard>('/api/invoices', { signal })
+      if (id === requestId.current && !signal?.aborted) {
+        setDashboard(next)
+        setLoadError('')
+      }
+    } catch (error) {
+      if (id === requestId.current && !signal?.aborted) {
+        setLoadError(error instanceof Error ? error.message : 'Could not load invoices.')
+      }
+    }
+  }, [])
+  const syncing = dashboard?.invoices.some((invoice) => invoice.syncPending) ?? false
+  useEffect(() => {
+    const controller = new AbortController()
+    queueMicrotask(() => { if (!controller.signal.aborted) void load(controller.signal) })
+    const refreshWhenFocused = () => { void load(controller.signal) }
+    window.addEventListener('focus', refreshWhenFocused)
+    return () => {
+      controller.abort()
+      window.removeEventListener('focus', refreshWhenFocused)
+    }
+  }, [load])
+  useEffect(() => {
+    if (!syncing) return
+    const timer = window.setInterval(() => { if (!document.hidden) void load() }, 4000)
+    return () => window.clearInterval(timer)
+  }, [load, syncing])
+
+  const invoices = dashboard?.invoices ?? []
+  const vendorOptions = [...new Set(invoices.flatMap((invoice) => invoice.vendor ? [invoice.vendor] : []))].sort((a, b) => a.localeCompare(b))
+  const yearOptions = [...new Set(invoices.flatMap((invoice) => invoice.invoiceDate ? [invoice.invoiceDate.slice(0, 4)] : []))].sort().reverse()
+  const query = search.trim().toLowerCase()
+  const matches = invoices.filter((invoice) =>
+    (!query || [invoice.vendor, invoice.invoiceId, invoice.invoiceNumber].some((value) => value?.toLowerCase().includes(query))) &&
+    (!vendor || invoice.vendor === vendor) && (!month || invoice.invoiceDate?.slice(5, 7) === month) &&
+    (!year || invoice.invoiceDate?.slice(0, 4) === year) &&
+    (!awaiting || invoice.paymentStatus === 'unpaid' || invoice.paymentStatus === 'partially_paid'),
+  )
+  const visible = showAll ? matches : matches.slice(0, pageSize)
+  const totals = totalByCurrency(matches)
+  const narrowed = Boolean(query || vendor || month || year || awaiting)
+  const pendingReview = dashboard?.reviews.find((row) => row.id === review?.id)
+
+  function openReceipt(invoice?: Invoice, file?: File) {
+    setModalError('')
+    setPayer('')
+    setReceipt({ invoice, file })
+  }
+
+  function resetListView() {
+    setShowAll(false)
+    setExpandedId(undefined)
+  }
+
+  function handleResult(result: UploadResult) {
+    setNotice({
+      invoice: 'Invoice added as unpaid.',
+      receipt: 'Receipt matched. The invoice will update when its proof is saved.',
+      duplicate: 'Already recorded. The existing invoice was kept.',
+      review: 'Check which invoice this receipt belongs to.',
+    }[result.kind])
+    if (result.reviewId) setReview({ id: result.reviewId, invoiceId: result.invoiceId ?? '' })
+    if (result.kind === 'invoice') {
+      setSearch('')
+      setVendor('')
+      setMonth('')
+      setYear('')
+      setAwaiting(false)
+      resetListView()
+    }
+  }
+
+  async function uploadFile(kind: 'invoice' | 'receipt', file: File, invoiceId?: string) {
+    setBusy(kind)
+    setNotice('')
+    setUploadError('')
+    setModalError('')
+    try {
+      if (file.size > 10 * 1024 * 1024) throw new Error('Choose a file smaller than 10 MB.')
+      const form = new FormData()
+      form.set('kind', kind)
+      if (invoiceId) form.set('invoiceId', invoiceId)
+      if (kind === 'receipt' && payer.trim()) form.set('paidBy', payer.trim())
+      form.set('files', file)
+      const result = await api<UploadResult>('/api/upload', { method: 'POST', body: form })
+      if (kind === 'receipt') setReceipt(undefined)
+      await load()
+      handleResult(result)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'The upload did not finish.'
+      if (kind === 'invoice') setUploadError(message)
+      else setModalError(message)
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  async function applyReview() {
+    if (!review?.invoiceId) return
+    setBusy('review')
+    setModalError('')
+    try {
+      const result = await api<UploadResult>('/api/receipt-reviews/' + review.id + '/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ invoiceId: review.invoiceId }),
+      })
+      setReview(undefined)
+      handleResult(result)
+      await load()
+    } catch (error) {
+      setModalError(error instanceof Error ? error.message : 'Could not confirm the receipt.')
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  return (
+    <>
+      <header className="topbar">
+        <div className="topbar-inner">
+          <span className="brand"><span className="brand-mark" aria-hidden="true">C</span>ChatDeal</span>
+          <div className="account"><span>{user.name}</span><button type="button" className="quiet-link" onClick={onLogout}>Sign out</button></div>
+        </div>
+      </header>
+      <main className="workspace">
+        <div className="page-title">
+          <h1>Invoice Manager</h1>
+          <p>Track vendor invoices and payment proof.</p>
+        </div>
+
+        <input ref={invoicePicker} type="file" accept={fileTypes} hidden onChange={(event) => {
+          const file = event.target.files?.[0]
+          event.target.value = ''
+          if (file) void uploadFile('invoice', file)
+        }} />
+        <div className="upload-grid">
+          {(['invoice', 'receipt'] as const).map((kind) => (
+            <button
+              type="button" key={kind} disabled={Boolean(busy)}
+              className={'upload-action upload-' + kind + (dragged === kind ? ' dragging' : '')}
+              onClick={() => kind === 'invoice' ? invoicePicker.current?.click() : openReceipt()}
+              onDragOver={(event) => { event.preventDefault(); if (!busy) setDragged(kind) }}
+              onDragLeave={() => setDragged(undefined)}
+              onDrop={(event) => {
+                event.preventDefault()
+                setDragged(undefined)
+                const file = event.dataTransfer.files[0]
+                if (file && !busy) {
+                  if (kind === 'invoice') void uploadFile('invoice', file)
+                  else openReceipt(undefined, file)
+                }
+              }}
+            >
+              <span className="upload-icon" aria-hidden="true">{kind === 'invoice' ? '↑' : '+'}</span>
+              <span><strong>{busy === kind ? 'Reading ' + kind + '…' : kind === 'invoice' ? 'Upload invoice' : 'Upload receipt'}</strong>
+                <small>{kind === 'invoice' ? 'Add a new vendor bill' : 'Match proof to an invoice'}</small></span>
+              <span className="upload-arrow" aria-hidden="true">↗</span>
+            </button>
+          ))}
+        </div>
+        <p className="file-note">PDF, JPG, or PNG · Up to 10 MB per file</p>
+        {notice && <p className="feedback" role="status">{notice}</p>}
+        {uploadError && <p className="feedback feedback-error" role="alert">{uploadError}</p>}
+        {dashboard && !dashboard.googleConnected && <p className="feedback">
+          Drive and Sheets will sync once Google is connected.
+          {dashboard.canConnectGoogle && <> <a href="/api/auth/google/login" target="_blank" rel="noreferrer">Connect Google</a></>}
+        </p>}
+
+        {!!dashboard?.reviews.length && (
+          <section className="review-list" aria-label="Receipts to review">
+            {dashboard.reviews.map((row) => (
+              <button type="button" className="review-notice" key={row.id} disabled={Boolean(busy)} onClick={() => {
+                setModalError('')
+                setReview({ id: row.id, invoiceId: row.targetInvoiceId ?? '' })
+              }}>
+                <span><strong>Receipt needs review</strong><small>{row.proof.vendorName ?? row.filename} · {formatMoney(row.proof.amount, row.proof.currency)}</small></span>
+                <span>Review ↗</span>
+              </button>
+            ))}
+          </section>
+        )}
+
+        <section className="register" aria-labelledby="register-title">
+          <div className="register-heading">
+            <h2 id="register-title">Invoices</h2>
+            <div className="segments" aria-label="Invoice list">
+              <button type="button" aria-pressed={!awaiting} onClick={() => { setAwaiting(false); resetListView() }}>All invoices</button>
+              <button type="button" aria-pressed={awaiting} onClick={() => { setAwaiting(true); resetListView() }}>Awaiting receipt</button>
+            </div>
+          </div>
+
+          <div className="filters">
+            <input type="search" value={search} onChange={(event) => { setSearch(event.target.value); resetListView() }}
+              aria-label="Search invoices" placeholder="Search vendor or invoice ID / number" />
+            <select aria-label="Vendor" value={vendor} onChange={(event) => { setVendor(event.target.value); resetListView() }}>
+              <option value="">All vendors</option>
+              {vendorOptions.map((item) => <option key={item}>{item}</option>)}
+            </select>
+            <select aria-label="Month" value={month} onChange={(event) => { setMonth(event.target.value); resetListView() }}>
+              <option value="">All months</option>
+              {months.map((label, index) => <option key={label} value={String(index + 1).padStart(2, '0')}>{label}</option>)}
+            </select>
+            <select aria-label="Year" value={year} onChange={(event) => { setYear(event.target.value); resetListView() }}>
+              <option value="">All years</option>
+              {yearOptions.map((item) => <option key={item}>{item}</option>)}
+            </select>
+          </div>
+
+          {dashboard && <div className="invoice-totals">
+            <div><span>{narrowed ? 'Matching invoices' : 'Total invoices'}</span><strong>{matches.length}</strong></div>
+            <div><span>Invoice amount</span><strong>
+              {totals.length ? totals.map(({ currency, amount }) => formatMoney(amount, currency)).join(' · ') : '—'}
+            </strong></div>
+          </div>}
+          {loadError && <p className="feedback feedback-error" role="alert">{loadError} <button className="quiet-link" type="button" onClick={() => void load()}>Retry</button></p>}
+          {!dashboard && !loadError && <p className="empty-state" role="status">Loading invoices…</p>}
+          {dashboard && !visible.length && <p className="empty-state">
+            {narrowed ? 'No invoices match this view.' : 'Upload an invoice to start tracking it.'}
+          </p>}
+
+          <ul className="invoice-list">
+            {visible.map((invoice) => {
+              const expanded = expandedId === invoice.id
+              return <li key={invoice.id} className="invoice-item">
+                <button className="invoice-row" type="button" aria-expanded={expanded}
+                  aria-controls={expanded ? 'details-' + invoice.id : undefined}
+                  onClick={() => setExpandedId(expanded ? undefined : invoice.id)}>
+                  <span className="invoice-identity">
+                    <strong>{invoice.vendor ?? 'Vendor not recorded'}</strong>
+                    <small>{[invoice.invoiceId, invoice.invoiceNumber, invoice.invoiceDate && formatDate(invoice.invoiceDate)].filter(Boolean).join(' · ')}</small>
+                  </span>
+                  <span className="invoice-amount">{formatMoney(invoice.total, invoice.currency)}</span>
+                  <span className="invoice-state">
+                    <span className={'status status-' + invoice.paymentStatus}>{labels[invoice.paymentStatus]}</span>
+                    {invoice.syncPending && <small>Sync pending</small>}
+                  </span>
+                  <Chevron expanded={expanded} />
+                </button>
+                {expanded && <InvoiceDetails invoice={invoice} onReceipt={() => openReceipt(invoice)} />}
+              </li>
+            })}
+          </ul>
+          {matches.length > pageSize && <button className="show-button" type="button"
+            aria-expanded={showAll} onClick={() => {
+              if (showAll && !matches.slice(0, pageSize).some((invoice) => invoice.id === expandedId)) setExpandedId(undefined)
+              setShowAll(!showAll)
+            }}>{showAll ? 'Show less' : 'Show all invoices'} <Chevron expanded={showAll} /></button>}
+        </section>
+      </main>
+
+      {receipt && <Modal title="Upload receipt" busy={Boolean(busy)} onClose={() => setReceipt(undefined)}>
+        <p className="dialog-intro">{receipt.invoice
+          ? [receipt.invoice.invoiceId, receipt.invoice.vendor, receipt.invoice.invoiceNumber].filter(Boolean).join(' · ')
+          : 'Choose a receipt or payment screenshot to match.'}</p>
+        <form className="dialog-form" onSubmit={(event) => {
+          event.preventDefault()
+          if (receipt.file) void uploadFile('receipt', receipt.file, receipt.invoice?.id)
+        }}>
+          <label>Payment proof
+            <input type="file" accept={fileTypes} disabled={Boolean(busy)} onChange={(event) => {
+              setReceipt({ ...receipt, file: event.target.files?.[0] })
+            }} />
+          </label>
+          {receipt.file && <small className="filename">{receipt.file.name}</small>}
+          <label>Paid by <span className="optional">(optional)</span>
+            <input type="text" placeholder="Name of the person who paid" value={payer} maxLength={120}
+              disabled={Boolean(busy)} onChange={(event) => setPayer(event.target.value)} />
+          </label>
+          {modalError && <p className="inline-error" role="alert">{modalError}</p>}
+          <button className="button button-primary" type="submit" disabled={Boolean(busy) || !receipt.file}>
+            {busy ? 'Checking payment proof…' : 'Upload receipt'}
+          </button>
+        </form>
+      </Modal>}
+      {review && pendingReview && <Modal title="Match receipt" busy={Boolean(busy)} onClose={() => setReview(undefined)}>
+        <p className="dialog-intro">Compare the payment proof with the invoice before confirming.</p>
+        <div className="proof-preview">
+          <strong>{pendingReview.proof.vendorName ?? pendingReview.filename}</strong>
+          <span>{formatMoney(pendingReview.proof.amount, pendingReview.proof.currency)} · {formatDate(pendingReview.proof.paymentDate)}</span>
+          {pendingReview.proof.transactionReference && <span>Payment reference {pendingReview.proof.transactionReference}</span>}
+          <a href={'/api/receipt-reviews/' + pendingReview.id + '/file'} target="_blank" rel="noreferrer">Open payment proof ↗</a>
+        </div>
+        <form className="dialog-form" onSubmit={(event) => { event.preventDefault(); void applyReview() }}>
+          <label>Invoice
+            <select value={review.invoiceId} disabled={Boolean(busy)} onChange={(event) => setReview({ ...review, invoiceId: event.target.value })}>
+              <option value="">Select invoice</option>
+              {invoices.filter((invoice) => invoice.currency === pendingReview.proof.currency).map((invoice) =>
+                <option key={invoice.id} value={invoice.id}>{[invoice.invoiceId, invoice.vendor, invoice.invoiceNumber,
+                  formatMoney(invoice.total, invoice.currency)].filter(Boolean).join(' · ')}</option>,
+              )}
+            </select>
+          </label>
+          {invoices.find((invoice) => invoice.id === review.invoiceId)?.invoiceUrl && <a
+            href={invoices.find((invoice) => invoice.id === review.invoiceId)?.invoiceUrl ?? undefined}
+            target="_blank" rel="noreferrer">Open selected invoice ↗</a>}
+          {modalError && <p className="inline-error" role="alert">{modalError}</p>}
+          <button className="button button-primary" type="submit" disabled={Boolean(busy) || !review.invoiceId}>
+            {busy ? 'Confirming…' : 'Confirm match'}
+          </button>
+        </form>
+      </Modal>}
+    </>
+  )
+}

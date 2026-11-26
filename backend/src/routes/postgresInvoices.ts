@@ -1,219 +1,93 @@
 import { Router } from 'express'
+import { z } from 'zod'
 import pool from '../db/postgres.js'
+import { googleOAuthClient } from '../services/googleAuth.js'
+import { confirmReceipt, getInvoice, getPayments, listReviews, presentInvoice } from '../services/invoiceRecords.js'
+import type { InvoiceRow } from '../services/invoiceRecords.js'
+import { runInvoiceSync } from '../services/sheetSyncWorker.js'
+import { sendWorkflowError } from './postgresUpload.js'
 
 const router = Router()
+const id = z.string().regex(/^[1-9]\d{0,17}$/)
 
-// Dashboard statistics
-router.get('/stats', async (_req, res) => {
+router.get('/invoices', async (req, res) => {
   try {
-    const [invoices, duplicates, expenses, documentTotals, balances] = await Promise.all([
-      pool.query('SELECT COUNT(*) AS total FROM invoices'),
-
-      pool.query(`
-        SELECT COUNT(*) AS total
-        FROM upload_events
-        WHERE is_duplicate = TRUE
+    const [result, reviews] = await Promise.all([
+      pool.query<InvoiceRow>(`
+        SELECT * FROM invoice_register ORDER BY uploaded_at DESC, id DESC
       `),
-
-      pool.query(`
-        SELECT COALESCE(SUM(total), 0) AS total
-        FROM invoice_extractions
-        WHERE currency = 'INR'
-          AND total IS NOT NULL
-      `),
-      pool.query(`
-        SELECT document_type, currency, SUM(total) AS total
-        FROM invoice_extractions
-        WHERE document_type IN ('invoice', 'receipt')
-          AND currency ~ '^[A-Z]{3}$' AND total IS NOT NULL
-        GROUP BY document_type, currency
-        ORDER BY currency
-      `),
-      pool.query(`
-        WITH paid AS (
-          SELECT a.invoice_id, SUM(a.amount) AS amount
-          FROM invoice_payment_allocations a
-          JOIN invoice_payments p ON p.id = a.payment_id
-          WHERE p.verified_at IS NOT NULL
-          GROUP BY a.invoice_id
-        )
-        SELECT e.currency, SUM(e.total) AS billed, SUM(COALESCE(paid.amount, 0)) AS paid
-        FROM invoice_extractions e LEFT JOIN paid ON paid.invoice_id = e.invoice_id
-        WHERE e.document_type = 'invoice' AND e.currency ~ '^[A-Z]{3}$' AND e.total IS NOT NULL
-        GROUP BY e.currency ORDER BY e.currency
-      `),
+      listReviews(),
     ])
-
-    res.json({
-      success: true,
-      totalInvoices: Number(invoices.rows[0].total),
-      duplicatesDetected: Number(duplicates.rows[0].total),
-      totalExpenses: Number(expenses.rows[0].total),
-      balances: balances.rows,
-      documentTotals: documentTotals.rows.map((row) => ({
-        documentType: row.document_type,
-        currency: row.currency,
-        total: Number(row.total),
-      })),
+    res.set('Cache-Control', 'no-store').json({
+      invoices: result.rows.map(presentInvoice),
+      reviews,
+      googleConnected: Boolean(googleOAuthClient.credentials.refresh_token || googleOAuthClient.credentials.access_token),
+      canConnectGoogle: Boolean(process.env.ADMIN_USER_EMAIL &&
+        process.env.ADMIN_USER_EMAIL.trim().toLowerCase() === req.session.user?.email.toLowerCase()),
     })
   } catch (error) {
-    console.error('PostgreSQL statistics error:', error)
-
-    res.status(500).json({
-      success: false,
-      error: 'Failed to retrieve statistics',
-    })
+    sendWorkflowError(res, error)
   }
 })
 
-// Invoice history
-router.get('/invoices', async (_req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT
-        i.id,
-        i.filename,
-        i.mime_type AS "mimeType",
-        i.file_size AS "fileSize",
-        i.uploaded_at AS "uploadedAt",
-        i.drive_file_url AS "driveFileUrl",
-        i.drive_status AS "driveStatus",
-
-        e.document_type AS "documentType",
-        e.invoice_number AS "invoiceNumber",
-        e.invoice_date AS "invoiceDate",
-        e.due_date AS "dueDate",
-        e.vendor_name AS "vendorName",
-        e.currency,
-        e.total,
-        COALESCE(applied.paid, 0) AS "confirmedPaid",
-        COALESCE(applied.reported, 0) AS "reportedPaid",
-        COALESCE(applied.has_receipt, false) AS "hasReceipt",
-        e.payment_status AS "paymentStatus",
-        e.financial_check_status AS "financialStatus",
-        e.extracted_at AS "extractedAt"
-
-      FROM invoices i
-      LEFT JOIN invoice_extractions e
-        ON i.id = e.invoice_id
-
-      LEFT JOIN LATERAL (
-        SELECT SUM(a.amount) FILTER (WHERE p.verified_at IS NOT NULL) AS paid,
-          SUM(a.amount) FILTER (WHERE p.verified_at IS NULL) AS reported,
-          BOOL_AND(EXISTS (
-            SELECT 1 FROM invoice_payment_receipts r WHERE r.payment_id = p.id
-          )) FILTER (WHERE p.verified_at IS NOT NULL) AS has_receipt
-        FROM invoice_payment_allocations a
-        JOIN invoice_payments p ON p.id = a.payment_id
-        WHERE a.invoice_id = i.id
-      ) applied ON true
-
-      ORDER BY i.id DESC
-      LIMIT 100
-    `)
-
-    const invoices = result.rows.map((invoice) => ({
-      ...invoice,
-      id: Number(invoice.id),
-      fileSize: Number(invoice.fileSize),
-      total:
-        invoice.total === null
-          ? null
-          : Number(invoice.total),
-    }))
-
-    res.json({
-      success: true,
-      count: invoices.length,
-      invoices,
-    })
-  } catch (error) {
-    console.error('PostgreSQL invoice history error:', error)
-
-    res.status(500).json({
-      success: false,
-      error: 'Failed to retrieve invoices',
-    })
-  }
-})
-
-// Individual invoice details
 router.get('/invoices/:id', async (req, res) => {
+  const invoiceId = id.safeParse(req.params.id)
+  if (!invoiceId.success) {
+    res.status(400).json({ error: 'Invalid invoice ID.' })
+    return
+  }
   try {
-    const invoiceId = Number(req.params.id)
-
-    if (!Number.isSafeInteger(invoiceId) || invoiceId <= 0) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid invoice ID',
-      })
-      return
-    }
-
-    const result = await pool.query(
-      `
-        SELECT
-          i.id,
-          i.filename,
-          i.drive_file_url AS "driveFileUrl",
-
-          e.document_type AS "documentType",
-          e.invoice_number AS "invoiceNumber",
-          e.invoice_date AS "invoiceDate",
-          e.due_date AS "dueDate",
-          e.vendor_name AS "vendorName",
-          e.currency,
-          e.subtotal,
-          e.tax_total AS "taxTotal",
-          e.total,
-          e.payment_status AS "paymentStatus",
-          e.category,
-          e.financial_check_status AS "financialStatus"
-
-        FROM invoices i
-        LEFT JOIN invoice_extractions e
-          ON i.id = e.invoice_id
-        WHERE i.id = $1
-      `,
-      [invoiceId]
-    )
-
-    const invoice = result.rows[0]
-
+    const invoice = await getInvoice(invoiceId.data)
     if (!invoice) {
-      res.status(404).json({
-        success: false,
-        error: 'Invoice not found',
-      })
+      res.status(404).json({ error: 'Invoice not found.' })
       return
     }
-
-    res.json({
-      success: true,
-      invoice: {
-        ...invoice,
-        id: Number(invoice.id),
-        subtotal:
-          invoice.subtotal === null
-            ? null
-            : Number(invoice.subtotal),
-        taxTotal:
-          invoice.taxTotal === null
-            ? null
-            : Number(invoice.taxTotal),
-        total:
-          invoice.total === null
-            ? null
-            : Number(invoice.total),
-      },
+    res.set('Cache-Control', 'no-store').json({
+      invoice: presentInvoice(invoice),
+      payments: await getPayments(invoice.id),
     })
   } catch (error) {
-    console.error('PostgreSQL invoice details error:', error)
+    sendWorkflowError(res, error)
+  }
+})
 
-    res.status(500).json({
-      success: false,
-      error: 'Failed to retrieve invoice',
-    })
+router.get('/receipt-reviews/:id/file', async (req, res) => {
+  const receiptId = id.safeParse(req.params.id)
+  if (!receiptId.success) {
+    res.status(404).end()
+    return
+  }
+  try {
+    const { rows: [row] } = await pool.query<{ content: Buffer; mime_type: string }>(`
+      SELECT w.content, i.mime_type
+      FROM invoice_work_files w JOIN invoices i ON i.id = w.document_id
+      WHERE w.document_id = $1 AND w.state = 'review'
+    `, [receiptId.data])
+    if (!row) {
+      res.status(404).end()
+      return
+    }
+    res.set({ 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' })
+      .type(row.mime_type).send(row.content)
+  } catch (error) {
+    sendWorkflowError(res, error)
+  }
+})
+
+router.post('/receipt-reviews/:id/confirm', async (req, res) => {
+  const receiptId = id.safeParse(req.params.id)
+  const invoiceId = id.safeParse(req.body?.invoiceId)
+  const actor = req.session.user?.email
+  if (!receiptId.success || !invoiceId.success || !actor) {
+    res.status(400).json({ error: 'Choose the invoice this receipt belongs to.' })
+    return
+  }
+  try {
+    const result = await confirmReceipt(receiptId.data, invoiceId.data, actor)
+    void runInvoiceSync()
+    res.json(result)
+  } catch (error) {
+    sendWorkflowError(res, error)
   }
 })
 

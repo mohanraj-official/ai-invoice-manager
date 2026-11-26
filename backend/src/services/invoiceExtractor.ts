@@ -12,10 +12,6 @@ const googleKey = process.env.GEMINI_API_KEY
 const openRouterModel =
   process.env.OPENROUTER_MODEL?.trim() || 'google/gemini-3.8-flash'
 
-if (!openRouterKey && !googleKey) {
-  throw new Error('Set OPENROUTER_API_KEY or GEMINI_API_KEY')
-}
-
 const google = !openRouterKey && googleKey
   ? new GoogleGenAI({ apiKey: googleKey })
   : undefined
@@ -54,6 +50,23 @@ const invoiceSchema = {
   additionalProperties: false,
   properties: {
     document_type: { type: 'string', enum: ['invoice', 'receipt', 'unknown'] },
+    receipt_details: {
+      type: ['object', 'null'],
+      additionalProperties: false,
+      properties: {
+        invoice_reference: nullableString,
+        transaction_reference: nullableString,
+        payment_date: nullableString,
+        amount_paid: nullableNumber,
+        payer_name: nullableString,
+        method: { type: 'string', enum: ['bank', 'card', 'upi', 'cash', 'other'] },
+        status: { type: 'string', enum: ['successful', 'pending', 'failed', 'unknown'] },
+      },
+      required: [
+        'invoice_reference', 'transaction_reference', 'payment_date', 'amount_paid',
+        'payer_name', 'method', 'status',
+      ],
+    },
     invoice_number: nullableString,
     invoice_date: nullableString,
     due_date: nullableString,
@@ -115,6 +128,7 @@ const invoiceSchema = {
 
   required: [
     'document_type',
+    'receipt_details',
     'invoice_number',
     'invoice_date',
     'due_date',
@@ -223,6 +237,10 @@ export async function extractInvoice(
   buffer: Buffer,
   mimeType: string,
 ): Promise<ExtractedInvoice> {
+  if (!openRouterKey && !googleKey) {
+    throw new Error('AI extraction is not configured')
+  }
+
   const supportedTypes = new Set([
     'application/pdf',
     'image/jpeg',
@@ -325,6 +343,19 @@ Follow these rules:
 20. Preserve the original currency. Use INR for explicit Indian rupees or ₹,
     USD for explicit USD or US$, and null for an ambiguous $ without enough
     context. Do not convert amounts.
+
+21. Set receipt_details to null unless this document shows a payment or attempted payment.
+    In receipt_details, distinguish the merchant's invoice number from a receipt number,
+    order number, UPI ID, or payment transaction identifier. Only put an explicitly
+    identified invoice number in invoice_reference. Prefer the UTR or bank reference
+    (preserving leading zeros) for transaction_reference, otherwise use the payment
+    processor's transaction ID. Do not use the invoice number or masked account number.
+    Extract the date and amount of the actual payment. A printed statement that an
+    invoice is paid cannot establish a separate payment date or transaction amount.
+    If no payer name is visible, use null. For UPI screenshots like PhonePe, use the
+    merchant name under "Paid to" as the vendor and classify "Transaction Successful"
+    as successful. Mark pending, failed, and reversed transfers appropriately; a
+    refund or reversal is not a successful payment to a vendor.
 `
 
   const base64 = buffer.toString('base64')
@@ -358,7 +389,8 @@ Follow these rules:
         model: openRouterModel,
         max_tokens: 8192,
         messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, attachment] }],
-        provider: { require_parameters: true },
+        provider: { require_parameters: true, zdr: true, data_collection: 'deny' },
+        ...(mimeType === 'application/pdf' ? { plugins: [{ id: 'file-parser', pdf: { engine: 'native' } }] } : {}),
         response_format: {
           type: 'json_schema',
           json_schema: { name: 'invoice', strict: true, schema: invoiceSchema },

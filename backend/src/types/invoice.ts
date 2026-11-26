@@ -16,8 +16,21 @@ export type InvoiceParty = {
 
 export type DocumentType = 'invoice' | 'receipt' | 'unknown'
 
+export type PaymentMethod = 'bank' | 'card' | 'upi' | 'cash' | 'other'
+
+export type ReceiptDetails = {
+  invoice_reference: string | null
+  transaction_reference: string | null
+  payment_date: string | null
+  amount_paid: number | null
+  payer_name: string | null
+  method: PaymentMethod
+  status: 'successful' | 'pending' | 'failed' | 'unknown'
+}
+
 export type ExtractedInvoice = {
   document_type?: DocumentType
+  receipt_details?: ReceiptDetails | null
   invoice_number: string | null
   invoice_date: string | null
   due_date: string | null

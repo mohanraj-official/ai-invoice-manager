@@ -1,11 +1,13 @@
 import pool from '../db/postgres.js'
+import type { PoolClient } from 'pg'
 import type { ExtractedInvoice } from '../types/invoice.js'
 import type { FinancialCheckStatus } from './invoiceRepository.js'
 
 export async function saveInvoiceExtractionPg(
-  invoiceId: number,
+  invoiceId: string | number,
   invoice: ExtractedInvoice,
   financialStatus: FinancialCheckStatus,
+  target: Pick<PoolClient, 'query'> = pool,
 ): Promise<void> {
   const columns = [
     'invoice_id',
@@ -72,7 +74,7 @@ export async function saveInvoiceExtractionPg(
     .map((column) => `${column} = EXCLUDED.${column}`)
     .join(', ')
 
-  await pool.query(
+  await target.query(
     `
       INSERT INTO invoice_extractions (
         ${columns.join(', ')}

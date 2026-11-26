@@ -24,7 +24,7 @@
 
 **AI, Integrations & Deployment**
 
-![Google Gemini](https://img.shields.io/badge/Google_Gemini-8E75B2?style=for-the-badge&logo=googlegemini&logoColor=white)
+![OpenRouter](https://img.shields.io/badge/OpenRouter-6558A6?style=for-the-badge)
 ![Google Drive](https://img.shields.io/badge/Google_Drive-4285F4?style=for-the-badge&logo=googledrive&logoColor=white)
 ![Google Sheets](https://img.shields.io/badge/Google_Sheets-34A853?style=for-the-badge&logo=googlesheets&logoColor=white)
 ![Google OAuth](https://img.shields.io/badge/Google_OAuth-4285F4?style=for-the-badge&logo=google&logoColor=white)
@@ -62,7 +62,7 @@
 
 | Application Workflow |
 |----------------------|
-| Invoice Upload → Duplicate Detection → Google Drive → Gemini AI Extraction → Financial Validation → PostgreSQL → Google Sheets → Dashboard |
+| Invoice or Receipt Upload → OpenRouter Extraction → Validation and Matching → PostgreSQL → Google Drive and Sheets |
 
 <br>
 
@@ -89,7 +89,7 @@
   </tr>
   <tr>
     <td align="center">Artificial Intelligence</td>
-    <td align="center">Google Gemini API</td>
+    <td align="center">OpenRouter</td>
   </tr>
   <tr>
     <td align="center">Cloud Integrations</td>
@@ -112,4 +112,25 @@
 <br>
 
 [AI Invoice Manager](https://ai-invoice-manager-rxj7.onrender.com) -  [Developer](https://github.com/mohanraj-official) 
+
+## Invoice and receipt workflow
+
+- Upload an invoice to create an unpaid record. The Drive filename and Sheets row use the same internal invoice ID.
+- Upload payment proof separately, or open an invoice and use **Upload receipt**. A clear match attaches automatically. Ambiguous proofs remain available for review.
+- The app stores individual verified payments, including multiple payments for the same invoice. The original invoice amount stays fixed. The balance and overpayment are calculated from those payments.
+- Google Drive stores invoices and receipts in `Merchant Payment Invoices / Vendor / Invoice Year`. The same invoice month and ID appear on both filenames. Google Sheets syncs one row per invoice. A failed Drive or Sheets sync retries from PostgreSQL.
+
+## Configure and run
+
+Use a separate Neon database or branch, Drive folder, and Sheet tab for testing. Copy `backend/.env.example` to `backend/.env` for local development, or set the matching variables on Render. Set `VITE_GOOGLE_CLIENT_ID` in the frontend build environment. Connect Drive and Sheets from the app with the admin account and make sure it has write access to the configured folder and tab.
+
+From `backend`, run `npm ci`, `npm run build`, `npm run migrate`, then `npm run start`. For local frontend development, run `npm ci` and `npm run dev` from `frontend`. For Render, build the frontend with the production client ID and run the backend with `NODE_ENV=production`.
+
+OpenRouter is configured to use endpoints that support structured output, zero data retention, and restricted data collection. Choose a compatible provider with native PDF and image support.
+
+## Reset invoice records
+
+Pause the live app before applying a reset so uploads and retries cannot write during the operation. From the configured backend, run `npm run reset:invoices -- --plan` to check the Neon host, invoice tab, and record counts. After verifying those targets, use `npm run reset:invoices -- --apply <database-host> <sheet-id> <tab>`.
+
+The reset clears the app's invoice, payment, and pending upload records and the invoice tab's data rows. It preserves the Drive originals, sheet header, invoice ID sequence, and login and Google authorization records.
 
